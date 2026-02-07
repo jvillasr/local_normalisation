@@ -714,6 +714,18 @@ def main() -> None:
     parser.add_argument("--full-dir", type=Path, default=DEFAULT_FULL_DIR)
     parser.add_argument("--pilot-source-dir", type=Path, default=DEFAULT_PILOT_SOURCE_DIR)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--spec-names",
+        nargs="*",
+        default=None,
+        help="Optional explicit spectrum names (spec-...) to evaluate.",
+    )
+    parser.add_argument(
+        "--max-specs",
+        type=int,
+        default=None,
+        help="Optional cap on number of pilot spectra after filtering.",
+    )
     parser.add_argument("--hotstars-code", type=Path, default=DEFAULT_HOTSTARS_CODE)
     parser.add_argument("--specfann-dir", type=Path, default=DEFAULT_SPECFANN_DIR)
     parser.add_argument("--bundle-name", type=str, default=DEFAULT_BUNDLE_NAME)
@@ -782,6 +794,17 @@ def main() -> None:
     (args.output_dir / "plots").mkdir(parents=True, exist_ok=True)
 
     pilot_specs = list_pilot_specs(args.pilot_source_dir)
+    if args.spec_names:
+        requested = [item.strip() for item in args.spec_names if item.strip()]
+        requested_set = set(requested)
+        pilot_specs = [spec for spec in pilot_specs if spec in requested_set]
+        missing = [spec for spec in requested if spec not in set(pilot_specs)]
+        if missing:
+            print(f"[warn] requested spectra not found in pilot source: {', '.join(missing)}")
+    if args.max_specs is not None:
+        pilot_specs = pilot_specs[: max(0, int(args.max_specs))]
+    if not pilot_specs:
+        raise RuntimeError("No spectra selected for evaluation.")
     lines = load_lines(args.lines_file)
 
     continuum_iterative_sigma_clip, _ = import_hotstars_normalisation(args.hotstars_code)
