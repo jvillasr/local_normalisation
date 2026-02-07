@@ -91,3 +91,47 @@ Reason:
 
 ## Next step
 Implement a second method variant that explicitly targets negative continuum bias (for example upper-envelope/asymmetric continuum fitting) and re-run this exact evaluator for fair comparison.
+
+---
+
+## Round 2: upper-envelope renorm trial
+
+### Implementation
+Added renorm mode `upper_envelope` in:
+- `scripts/evaluate_balmer_renorm_methods.py`
+
+### Main benchmark command
+
+```bash
+UV_CACHE_DIR=/nexus/posix0/MIA-astro-env/hxr/jvillasr/.tmp/uv-cache uv run python scripts/evaluate_balmer_renorm_methods.py \
+  --output-dir experiments/20260207_wing_anchor_renorm/pilot_eval_upper_v1 \
+  --methods \
+    p98_k1p5_fit:p98:1.5:fit \
+    p98_k2_fit:p98:2.0:fit \
+    upper_k1p5_fit:upper_envelope:1.5:fit \
+    upper_k2_fit:upper_envelope:2.0:fit
+```
+
+### Main benchmark result
+From `pilot_eval_upper_v1/summary_by_method.csv`:
+- `p98_k1p5_fit`: `0.572458` (best)
+- `upper_k1p5_fit`: `0.607025`
+- `p98_k2_fit`: `0.624273`
+- `upper_k2_fit`: `0.746034`
+
+Upper-envelope did not beat p98 in this round.
+
+### Upper-envelope tuning scans
+Commands run (all with `--methods p98_k1p5_fit:p98:1.5:fit upper_k1p5_fit:upper_envelope:1.5:fit`):
+
+- `upper_scan_a`: `--upper-inner-scale 1.2 --upper-outer-scale 3.0 --upper-envelope-percentile 92 --upper-min-points 8 --upper-clip-min 0.90 --upper-clip-max 1.35`
+- `upper_scan_b`: `--upper-inner-scale 1.5 --upper-outer-scale 3.5 --upper-envelope-percentile 95 --upper-min-points 8 --upper-clip-min 0.90 --upper-clip-max 1.40`
+- `upper_scan_c`: `--upper-inner-scale 2.0 --upper-outer-scale 4.0 --upper-envelope-percentile 95 --upper-min-points 6 --upper-clip-min 0.90 --upper-clip-max 1.40`
+- `upper_scan_d`: `--upper-inner-scale 1.0 --upper-outer-scale 3.0 --upper-envelope-percentile 85 --upper-min-points 10 --upper-clip-min 0.85 --upper-clip-max 1.30`
+
+Best tuned upper result:
+- `upper_scan_b`: `upper_k1p5_fit = 0.594138`
+- Still worse than `p98_k1p5_fit = 0.572458` by `+0.021680`.
+
+### Updated decision
+Status remains: **NO-GO for whole-sample rollout**.

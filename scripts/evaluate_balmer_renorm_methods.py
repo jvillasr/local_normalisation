@@ -55,7 +55,7 @@ DEFAULT_HOTSTARS_CODE = Path("/nexus/posix0/MIA-astro-env/hxr/jvillasr/SDSS/HotS
 @dataclass(frozen=True)
 class MethodConfig:
     name: str
-    renorm_mode: str  # none | p98 | wing_anchor
+    renorm_mode: str  # none | p98 | wing_anchor | upper_envelope
     balmer_mask_k: float
     balmer_mask_stage: str
 
@@ -212,6 +212,103 @@ def renorm_wing_anchor_continuum(
     return out, meta
 
 
+def renorm_upper_envelope_continuum(
+    wave: np.ndarray,
+    flux: np.ndarray,
+    continuum: np.ndarray,
+    *,
+    base_mask: np.ndarray,
+    line_range: tuple[float, float],
+    centre: float,
+    fwhm: float,
+    extra_mask: np.ndarray | None,
+    smooth_sigma_px: float,
+    envelope_percentile: float,
+    spike_sigma: float,
+    inner_scale: float,
+    outer_scale: float,
+    min_points: int,
+    clip_min: float,
+    clip_max: float,
+) -> tuple[np.ndarray, dict[str, float | int | str]]:
+    meta: dict[str, float | int | str] = {
+        "status": "ok",
+        "centre": float(centre),
+        "fwhm": float(fwhm),
+    }
+    if not np.isfinite(fwhm) or fwhm <= 0:
+        meta["status"] = "invalid_fwhm"
+        return continuum, meta
+
+    lo, hi = line_range
+    mask = base_mask & (wave >= lo) & (wave <= hi)
+    if extra_mask is not None and extra_mask.shape == mask.shape:
+        mask &= extra_mask
+
+    ratio = np.full_like(flux, np.nan, dtype=float)
+    valid = mask & np.isfinite(flux) & np.isfinite(continuum) & (continuum > 0)
+    ratio[valid] = flux[valid] / continuum[valid]
+    if smooth_sigma_px > 0:
+        finite_ratio = np.isfinite(ratio)
+        if np.count_nonzero(finite_ratio) > 3:
+            fill = float(np.nanmedian(ratio[finite_ratio]))
+            work = ratio.copy()
+            work[~finite_ratio] = fill
+            ratio = gaussian_filter1d(work, sigma=smooth_sigma_px, mode="nearest")
+            ratio[~mask] = np.nan
+
+    dist = np.abs(wave - centre)
+    candidate = mask & (dist >= inner_scale * fwhm) & (dist <= outer_scale * fwhm) & np.isfinite(ratio)
+    n_candidate = int(np.count_nonzero(candidate))
+    meta["n_candidate"] = n_candidate
+    if n_candidate < max(min_points, 4):
+        meta["status"] = "insufficient_wings"
+        return continuum, meta
+
+    vals = ratio[candidate]
+    thresh = _robust_upper_anchor(vals, percentile=envelope_percentile, spike_sigma=spike_sigma)
+    if not np.isfinite(thresh):
+        meta["status"] = "invalid_anchor"
+        return continuum, meta
+
+    env = candidate & (ratio >= thresh)
+    n_env = int(np.count_nonzero(env))
+    if n_env < max(min_points, 4):
+        cand_idx = np.where(candidate)[0]
+        order = np.argsort(ratio[cand_idx])
+        keep_idx = cand_idx[order[-max(min_points, 4) :]]
+        env = np.zeros_like(candidate, dtype=bool)
+        env[keep_idx] = True
+        n_env = int(np.count_nonzero(env))
+    meta["n_envelope"] = n_env
+    meta["threshold"] = float(thresh)
+
+    x = wave[env] - centre
+    y = ratio[env]
+    if x.size < 4:
+        meta["status"] = "insufficient_envelope"
+        return continuum, meta
+
+    # Slightly favour the highest-envelope points.
+    w = np.clip(y - np.nanmedian(y) + 1.0, 0.1, 10.0)
+    try:
+        slope, intercept = np.polyfit(x, y, deg=1, w=w)
+    except Exception:
+        slope = 0.0
+        intercept = float(np.nanmedian(y))
+
+    corr = intercept + slope * (wave - centre)
+    corr = np.clip(corr, clip_min, clip_max)
+
+    out = continuum.copy()
+    apply_mask = mask & np.isfinite(corr)
+    out[apply_mask] = continuum[apply_mask] * corr[apply_mask]
+
+    meta["intercept"] = float(intercept)
+    meta["slope"] = float(slope)
+    return out, meta
+
+
 def apply_method_renorm(
     method: MethodConfig,
     window_results: list[dict[str, object]],
@@ -226,6 +323,12 @@ def apply_method_renorm(
     wing_min_points_side: int,
     wing_clip_min: float,
     wing_clip_max: float,
+    upper_inner_scale: float,
+    upper_outer_scale: float,
+    upper_envelope_percentile: float,
+    upper_min_points: int,
+    upper_clip_min: float,
+    upper_clip_max: float,
 ) -> None:
     if method.renorm_mode == "none":
         return
@@ -257,11 +360,11 @@ def apply_method_renorm(
             result["flux_norm"] = flux / np.clip(cont, 1e-12, None)
             continue
 
-        if method.renorm_mode != "wing_anchor":
+        if method.renorm_mode not in {"wing_anchor", "upper_envelope"}:
             raise ValueError(f"Unsupported renorm mode: {method.renorm_mode}")
 
         group_lines = [str(item) for item in result.get("lines", [])]
-        wing_meta: dict[str, dict[str, float | int | str]] = {}
+        renorm_meta: dict[str, dict[str, float | int | str]] = {}
 
         for line in BALMER_LINES:
             if line not in group_lines:
@@ -294,33 +397,53 @@ def apply_method_renorm(
                     centre = centre_est
 
             if centre is None or fwhm is None:
-                wing_meta[line] = {"status": "missing_fwhm"}
+                renorm_meta[line] = {"status": "missing_fwhm"}
                 continue
 
             extra_mask = result.get("fwhm_mask")
-            cont, line_meta = renorm_wing_anchor_continuum(
-                wave,
-                flux,
-                cont,
-                base_mask=base_mask,
-                line_range=fit_range,
-                centre=float(centre),
-                fwhm=float(fwhm),
-                extra_mask=extra_mask if isinstance(extra_mask, np.ndarray) else None,
-                smooth_sigma_px=smooth_sigma_px,
-                anchor_percentile=wing_anchor_percentile,
-                spike_sigma=spike_sigma,
-                inner_scale=wing_inner_scale,
-                outer_scale=wing_outer_scale,
-                min_points_side=wing_min_points_side,
-                clip_min=wing_clip_min,
-                clip_max=wing_clip_max,
-            )
-            wing_meta[line] = line_meta
+            if method.renorm_mode == "wing_anchor":
+                cont, line_meta = renorm_wing_anchor_continuum(
+                    wave,
+                    flux,
+                    cont,
+                    base_mask=base_mask,
+                    line_range=fit_range,
+                    centre=float(centre),
+                    fwhm=float(fwhm),
+                    extra_mask=extra_mask if isinstance(extra_mask, np.ndarray) else None,
+                    smooth_sigma_px=smooth_sigma_px,
+                    anchor_percentile=wing_anchor_percentile,
+                    spike_sigma=spike_sigma,
+                    inner_scale=wing_inner_scale,
+                    outer_scale=wing_outer_scale,
+                    min_points_side=wing_min_points_side,
+                    clip_min=wing_clip_min,
+                    clip_max=wing_clip_max,
+                )
+            else:
+                cont, line_meta = renorm_upper_envelope_continuum(
+                    wave,
+                    flux,
+                    cont,
+                    base_mask=base_mask,
+                    line_range=fit_range,
+                    centre=float(centre),
+                    fwhm=float(fwhm),
+                    extra_mask=extra_mask if isinstance(extra_mask, np.ndarray) else None,
+                    smooth_sigma_px=smooth_sigma_px,
+                    envelope_percentile=upper_envelope_percentile,
+                    spike_sigma=spike_sigma,
+                    inner_scale=upper_inner_scale,
+                    outer_scale=upper_outer_scale,
+                    min_points=upper_min_points,
+                    clip_min=upper_clip_min,
+                    clip_max=upper_clip_max,
+                )
+            renorm_meta[line] = line_meta
 
         result["continuum"] = cont
         result["flux_norm"] = flux / np.clip(cont, 1e-12, None)
-        result["wing_anchor_meta"] = wing_meta
+        result["renorm_meta"] = renorm_meta
 
 
 def build_balmer_lookup(
@@ -560,7 +683,7 @@ def plot_metric_panels(metrics_df: pd.DataFrame, output_path: Path) -> None:
 
     for ax, (col, title) in zip(axes.ravel(), metrics):
         data = [ok.loc[ok["method"] == method, col].dropna().values for method in methods]
-        ax.boxplot(data, labels=methods, showfliers=False)
+        ax.boxplot(data, tick_labels=methods, showfliers=False)
         ax.axhline(0.0, color="0.5", ls="--", lw=0.8)
         ax.set_title(title)
         ax.tick_params(axis="x", rotation=20)
@@ -621,6 +744,12 @@ def main() -> None:
     parser.add_argument("--wing-min-points-side", type=int, default=8)
     parser.add_argument("--wing-clip-min", type=float, default=0.75)
     parser.add_argument("--wing-clip-max", type=float, default=1.35)
+    parser.add_argument("--upper-inner-scale", type=float, default=0.8)
+    parser.add_argument("--upper-outer-scale", type=float, default=2.5)
+    parser.add_argument("--upper-envelope-percentile", type=float, default=88.0)
+    parser.add_argument("--upper-min-points", type=int, default=10)
+    parser.add_argument("--upper-clip-min", type=float, default=0.85)
+    parser.add_argument("--upper-clip-max", type=float, default=1.20)
 
     parser.add_argument("--eval-inner-fwhm", type=float, default=0.6)
     parser.add_argument("--eval-outer-fwhm", type=float, default=1.8)
@@ -635,6 +764,8 @@ def main() -> None:
             "none_k1p5_fit:none:1.5:fit",
             "wing_k1p5_fit:wing_anchor:1.5:fit",
             "wing_k2_fit:wing_anchor:2.0:fit",
+            "upper_k1p5_fit:upper_envelope:1.5:fit",
+            "upper_k2_fit:upper_envelope:2.0:fit",
         ],
         help="Method specs as name:renorm_mode:mask_k:mask_stage",
     )
@@ -741,6 +872,12 @@ def main() -> None:
                 wing_min_points_side=args.wing_min_points_side,
                 wing_clip_min=args.wing_clip_min,
                 wing_clip_max=args.wing_clip_max,
+                upper_inner_scale=args.upper_inner_scale,
+                upper_outer_scale=args.upper_outer_scale,
+                upper_envelope_percentile=args.upper_envelope_percentile,
+                upper_min_points=args.upper_min_points,
+                upper_clip_min=args.upper_clip_min,
+                upper_clip_max=args.upper_clip_max,
             )
 
             windows = build_balmer_lookup(window_results, line_windows)
