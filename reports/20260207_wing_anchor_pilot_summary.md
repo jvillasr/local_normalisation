@@ -66,3 +66,26 @@ Results (`summary_by_method.csv`):
 Tuning scan of upper-envelope parameters improved `upper_k1p5_fit` only to `0.594138` (best), still above `0.572458`.
 
 Updated judgement: upper-envelope v1/v1-tuned is still not sufficient to replace p98 baseline.
+
+## Update: fit-stage methods (branch `claude/20260207_asymmetric_fitstage`)
+
+Pivoted from post-fit renorm to genuinely different continuum-fitting approaches for Balmer windows:
+
+1. **Quantile regression spline** (`quantile_spline`, tau=0.85): IRLS spline targeting the 85th quantile — naturally biases continuum upward.
+2. **Penalised upper-envelope spline** (`penalised_upper`): iteratively removes low points and refits.
+3. **Lorentzian deblend** (`lorentzian_deblend`): joint Lorentzian absorption + polynomial continuum fit — physically motivated.
+
+### Final 12-star pilot results
+
+| Method | Composite | abs_bias | under_frac | Improvement vs p98 |
+|---|---:|---:|---:|---:|
+| lordeblend_p98 | **0.107** | 0.013 | 0.18 | **81%** |
+| qs85_p98 | 0.274 | 0.020 | 0.50 | 52% |
+| pupper_p98 | 0.513 | 0.019 | 0.98 | 10% |
+| p98_k1p5_fit | 0.572 | 0.049 | 1.00 | — |
+
+### Recommended method
+`lordeblend_p98` — Lorentzian deblend + p98 renorm. The Lorentzian model correctly separates the broad Balmer wing absorption from the pseudo-continuum, solving the core problem.
+
+### Decision: **GO** for scale-up
+Both `lordeblend_p98` and `qs85_p98` meet all scale-up gate criteria. See full details in `experiments/20260207_asymmetric_fitstage/README.md`.

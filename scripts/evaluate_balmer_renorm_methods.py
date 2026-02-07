@@ -34,6 +34,7 @@ from plot_balmer_local_vs_full import (  # type: ignore
     plot_balmer_comparison,
     plot_lorentzian_fits,
 )
+from fit_stage_methods import apply_fitstage_to_balmer_windows  # type: ignore
 
 DEFAULT_INPUT_DIR = Path(
     "/nexus/posix0/MIA-astro-env/hxr/shared/FEROS_data/BOSS_data/boss_v6_2_1_cache"
@@ -58,6 +59,7 @@ class MethodConfig:
     renorm_mode: str  # none | p98 | wing_anchor | upper_envelope
     balmer_mask_k: float
     balmer_mask_stage: str
+    fit_mode: str = "standard"  # standard | quantile_spline | penalised_upper | lorentzian_deblend
 
 
 def parse_field_from_spec_name(spec_name: str) -> str:
@@ -527,6 +529,7 @@ def measure_line_metrics(
             "renorm_mode": method.renorm_mode,
             "mask_k": method.balmer_mask_k,
             "mask_stage": method.balmer_mask_stage,
+            "fit_mode": method.fit_mode,
             "status": "fit_failed",
             "n_wing": 0,
         }
@@ -559,6 +562,7 @@ def measure_line_metrics(
             "renorm_mode": method.renorm_mode,
             "mask_k": method.balmer_mask_k,
             "mask_stage": method.balmer_mask_stage,
+            "fit_mode": method.fit_mode,
             "status": "insufficient_wing_points",
             "n_wing": n_wing,
             "fit_fwhm": fwhm,
@@ -596,6 +600,7 @@ def measure_line_metrics(
         "renorm_mode": method.renorm_mode,
         "mask_k": method.balmer_mask_k,
         "mask_stage": method.balmer_mask_stage,
+        "fit_mode": method.fit_mode,
         "status": "ok",
         "n_wing": n_wing,
         "fit_fwhm": fwhm,
@@ -766,20 +771,30 @@ def main() -> None:
     parser.add_argument("--eval-inner-fwhm", type=float, default=0.6)
     parser.add_argument("--eval-outer-fwhm", type=float, default=1.8)
 
+    # Fit-stage method parameters
+    parser.add_argument("--qs-tau", type=float, default=0.85, help="Quantile spline: target quantile (0-1).")
+    parser.add_argument("--qs-knot-spacing", type=float, default=8.0, help="Quantile spline: knot spacing (A).")
+    parser.add_argument("--qs-n-iter", type=int, default=15, help="Quantile spline: IRLS iterations.")
+    parser.add_argument("--qs-smooth", type=float, default=1.5, help="Quantile spline: smoothing sigma (px).")
+    parser.add_argument("--pu-knot-spacing", type=float, default=8.0, help="Penalised upper: knot spacing (A).")
+    parser.add_argument("--pu-n-iter", type=int, default=6, help="Penalised upper: iterations.")
+    parser.add_argument("--pu-keep-frac", type=float, default=0.3, help="Penalised upper: MAD fraction below to keep.")
+    parser.add_argument("--pu-smooth", type=float, default=1.5, help="Penalised upper: smoothing sigma (px).")
+    parser.add_argument("--pu-init-smooth", type=float, default=5.0, help="Penalised upper: initial smoothing (px).")
+
     parser.add_argument(
         "--methods",
         type=str,
         nargs="*",
         default=[
-            "p98_k1p5_fit:p98:1.5:fit",
-            "p98_k2_fit:p98:2.0:fit",
-            "none_k1p5_fit:none:1.5:fit",
-            "wing_k1p5_fit:wing_anchor:1.5:fit",
-            "wing_k2_fit:wing_anchor:2.0:fit",
-            "upper_k1p5_fit:upper_envelope:1.5:fit",
-            "upper_k2_fit:upper_envelope:2.0:fit",
+            "p98_k1p5_fit:p98:1.5:fit:standard",
+            "p98_k2_fit:p98:2.0:fit:standard",
+            "none_k1p5_fit:none:1.5:fit:standard",
+            "qs85_k1p5_fit:none:1.5:fit:quantile_spline",
+            "pupper_k1p5_fit:none:1.5:fit:penalised_upper",
+            "lordeblend_k1p5_fit:none:1.5:fit:lorentzian_deblend",
         ],
-        help="Method specs as name:renorm_mode:mask_k:mask_stage",
+        help="Method specs as name:renorm_mode:mask_k:mask_stage[:fit_mode]",
     )
     parser.add_argument("--make-star-plots", action="store_true", default=True)
     parser.add_argument("--no-make-star-plots", dest="make_star_plots", action="store_false")
@@ -787,8 +802,18 @@ def main() -> None:
 
     methods: list[MethodConfig] = []
     for spec in args.methods:
-        name, mode, k, stage = spec.split(":")
-        methods.append(MethodConfig(name=name, renorm_mode=mode, balmer_mask_k=float(k), balmer_mask_stage=stage))
+        parts = spec.split(":")
+        if len(parts) == 4:
+            name, mode, k, stage = parts
+            fit_mode = "standard"
+        elif len(parts) == 5:
+            name, mode, k, stage, fit_mode = parts
+        else:
+            raise ValueError(f"Bad method spec (expect 4 or 5 colon-separated fields): {spec!r}")
+        methods.append(MethodConfig(
+            name=name, renorm_mode=mode, balmer_mask_k=float(k),
+            balmer_mask_stage=stage, fit_mode=fit_mode,
+        ))
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "plots").mkdir(parents=True, exist_ok=True)
@@ -882,6 +907,23 @@ def main() -> None:
                 balmer_mask=balmer_mask,
             )
 
+            # ----- Fit-stage replacement (if not "standard") -----
+            if method.fit_mode != "standard":
+                apply_fitstage_to_balmer_windows(
+                    method.fit_mode,
+                    window_results,
+                    line_windows,
+                    qs_tau=args.qs_tau,
+                    qs_knot_spacing=args.qs_knot_spacing,
+                    qs_n_iter=args.qs_n_iter,
+                    qs_smooth=args.qs_smooth,
+                    pu_knot_spacing=args.pu_knot_spacing,
+                    pu_n_iter=args.pu_n_iter,
+                    pu_keep_frac=args.pu_keep_frac,
+                    pu_smooth=args.pu_smooth,
+                    pu_init_smooth=args.pu_init_smooth,
+                )
+
             apply_method_renorm(
                 method,
                 window_results,
@@ -934,6 +976,7 @@ def main() -> None:
                             "renorm_mode": method.renorm_mode,
                             "mask_k": method.balmer_mask_k,
                             "mask_stage": method.balmer_mask_stage,
+                            "fit_mode": method.fit_mode,
                             "status": "line_missing",
                             "n_wing": 0,
                         }
