@@ -1,0 +1,23 @@
+name: local_window_v1
+method: local_line_windows
+window:
+  merge_windows: true
+  balmer_blue_pad_angstrom: 20
+  hdelta_blue_pad_angstrom: 10
+continuum_fit:
+  win_kms: 1200
+  min_win_px: 21
+  sigma_lower: 2.0
+  sigma_upper: 3.0
+  n_iter: 3
+  spline_order: 3
+  smooth_scale: 50.0
+renorm:
+  mode: p98
+  percentile: 98.0
+  spike_sigma: 4.0
+balmer_fwhm_mask:
+  enabled: true
+  k: 1.5
+  stage: fit
+  smooth_sigma_px: 2.0

@@ -1,0 +1,6 @@
+name: baseline_full
+reference_impl: HotStarsBOSS/code/boss_normalisation.py
+purpose: Baseline comparator for local methods
+notes:
+  - Use same spectra subset as local pilot when comparing.
+  - Keep this config immutable except for metadata updates.

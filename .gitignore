@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Environments and caches
+.venv/
+.uv-cache/
+.uv_cache/
+
+# Data products and large artefacts
+*.h5
+*.parquet
+*.fits
+*.npy
+*.npz
+
+# Plots and logs
+*.png
+*.pdf
+*.log
+
+# Allow tracked placeholders
+!tests/data/.gitkeep

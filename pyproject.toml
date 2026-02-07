@@ -1,0 +1,22 @@
+[project]
+name = "local-norm-boss"
+version = "0.1.0"
+description = "Local BOSS normalisation pipeline for SpecFANN inputs"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "scipy",
+  "astropy",
+  "h5py",
+  "matplotlib",
+  "pandas",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=7",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
