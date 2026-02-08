@@ -330,6 +330,93 @@ BALMER_CENTRES = {
 BALMER_LINES = ["HDELTA", "HGAMMA", "HBETA", "HALPHA"]
 
 
+# ---------------------------------------------------------------------------
+# Method 4 — Balmer Template Subtraction
+# ---------------------------------------------------------------------------
+
+def _fit_absorption_lorentzian(
+    wave: np.ndarray,
+    flux: np.ndarray,
+    *,
+    centre_hint: float,
+    fwhm_hint: float | None = None,
+    ivar: np.ndarray | None = None,
+    fit_range: tuple[float, float] | None = None,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """
+    Fit Lorentzian absorption + linear continuum and return the absorption
+    component evaluated at every wavelength in *wave*.
+
+    Returns ``(absorption, meta)`` where *absorption* is non-negative (zero
+    where no correction is made) and *meta* contains the fitted parameters.
+    """
+    zero = np.zeros_like(wave, dtype=float)
+
+    mask = np.isfinite(wave) & np.isfinite(flux)
+    if fit_range is not None:
+        mask &= (wave >= fit_range[0]) & (wave <= fit_range[1])
+    if ivar is not None:
+        mask &= np.isfinite(ivar) & (ivar > 0)
+    if np.count_nonzero(mask) < 8:
+        return zero, {"status": "insufficient_points"}
+
+    w = wave[mask]
+    f = flux[mask]
+    lo, hi = float(w.min()), float(w.max())
+
+    c0_guess = float(np.nanpercentile(f, 90))
+    depth_guess = float(max(c0_guess - np.nanmin(f), 1e-3))
+    if fwhm_hint is None or not np.isfinite(fwhm_hint):
+        fwhm_hint = max(1.0, 0.15 * (hi - lo))
+    gamma_guess = max(0.3, float(fwhm_hint) / 2.0)
+
+    def model(x, c0, c1, depth, ctr, gamma):
+        return c0 + c1 * (x - ctr) - depth / (1.0 + ((x - ctr) / gamma) ** 2)
+
+    p0 = [c0_guess, 0.0, depth_guess, float(centre_hint), gamma_guess]
+    lower = [0.0, -np.inf, 0.0, lo, 0.1]
+    upper = [np.inf, np.inf, c0_guess * 3.0, hi, hi - lo]
+
+    sigma = None
+    if ivar is not None:
+        iv = ivar[mask]
+        sigma = np.where(iv > 0, 1.0 / np.sqrt(iv), np.inf)
+
+    try:
+        params, _ = curve_fit(
+            model, w, f, p0=p0, bounds=(lower, upper),
+            sigma=sigma, absolute_sigma=False, maxfev=15_000,
+        )
+    except Exception:
+        return zero, {"status": "fit_failed"}
+
+    depth, ctr, gamma = params[2], params[3], params[4]
+
+    # Sanity: if depth is negligible, gamma unreasonable, or FWHM too wide,
+    # skip.  A FWHM > 40 A is almost certainly degenerate for Balmer lines.
+    if depth < 1e-3 or gamma < 0.5:
+        return zero, {"status": "degenerate_fit", "depth": depth, "gamma": gamma}
+    if 2.0 * gamma > 40.0:
+        return zero, {"status": "fwhm_too_wide", "fwhm": 2.0 * gamma}
+
+    # Absorption profile at all wavelengths.
+    absorption = depth / (1.0 + ((wave - ctr) / gamma) ** 2)
+    absorption[~np.isfinite(wave)] = 0.0
+    # Only apply within a generous range around the line centre (5 × gamma)
+    # to avoid tiny corrections far from the line biasing the spline.
+    far = np.abs(wave - ctr) > 5.0 * gamma
+    absorption[far] = 0.0
+
+    meta = {
+        "status": "ok",
+        "depth": float(depth),
+        "centre": float(ctr),
+        "gamma": float(gamma),
+        "fwhm": float(2.0 * gamma),
+    }
+    return absorption, meta
+
+
 def apply_fitstage_to_balmer_windows(
     fit_mode: str,
     window_results: list[dict[str, object]],
@@ -347,6 +434,9 @@ def apply_fitstage_to_balmer_windows(
     pu_smooth: float = 1.5,
     pu_init_smooth: float = 5.0,
     # lorentzian_deblend: no extra params beyond line centres
+    # balmer_subtract: needs the sigma-clip continuum fitter
+    continuum_fit_func: object | None = None,
+    continuum_fit_kwargs: dict | None = None,
 ) -> None:
     """
     Replace the continuum in Balmer windows using the specified fit-stage
@@ -355,10 +445,15 @@ def apply_fitstage_to_balmer_windows(
     Parameters
     ----------
     fit_mode : one of ``"standard"``, ``"quantile_spline"``,
-        ``"penalised_upper"``, ``"lorentzian_deblend"``.
+        ``"penalised_upper"``, ``"lorentzian_deblend"``, ``"balmer_subtract"``.
     window_results : list of per-window dicts produced by
         ``local_normalise_windows()``.
     line_windows : dict mapping line name to (lo, hi) range.
+    continuum_fit_func : callable
+        The sigma-clip spline fitter (only needed for ``"balmer_subtract"``).
+    continuum_fit_kwargs : dict
+        Keyword arguments for *continuum_fit_func* (only needed for
+        ``"balmer_subtract"``).
     """
     if fit_mode == "standard":
         return
@@ -447,6 +542,106 @@ def apply_fitstage_to_balmer_windows(
 
             # For non-Balmer portions of the group, keep original continuum.
             # (new_cont was initialised from result["continuum"].)
+
+        elif fit_mode == "balmer_subtract":
+            # -----------------------------------------------------------
+            # Balmer template subtraction.
+            #
+            # 1. Fit a Lorentzian to each Balmer line → get wing absorption.
+            # 2. Add the absorption back to the raw flux → "corrected flux"
+            #    that looks like the continuum (+ noise + metal lines) with
+            #    the broad Balmer wings removed.
+            # 3. Re-run the sigma-clip spline on the corrected flux.
+            # 4. Use that spline as the continuum for the *original* flux.
+            #
+            # This preserves the sigma-clip spline's strength for non-Balmer
+            # features while preventing the wing pull-down.
+            # -----------------------------------------------------------
+            if continuum_fit_func is None:
+                raise ValueError(
+                    "balmer_subtract requires continuum_fit_func and "
+                    "continuum_fit_kwargs"
+                )
+            cfit_kw = continuum_fit_kwargs or {}
+
+            total_absorption = np.zeros_like(flux, dtype=float)
+            for line in BALMER_LINES:
+                if line not in group_lines:
+                    continue
+                fit_range = line_windows.get(line)
+                if fit_range is None:
+                    continue
+                centre = BALMER_CENTRES.get(line)
+                if centre is None:
+                    continue
+
+                # FWHM hint from preliminary fit metadata.
+                fwhm_hint = None
+                fwhm_meta = result.get("fwhm_meta")
+                if isinstance(fwhm_meta, dict):
+                    lines_meta = fwhm_meta.get("lines")
+                    if isinstance(lines_meta, dict) and isinstance(
+                        lines_meta.get(line), dict
+                    ):
+                        fwhm_hint = lines_meta[line].get("fwhm")
+                        ctr = lines_meta[line].get("centre")
+                        if ctr is not None:
+                            centre = float(ctr)
+
+                # --- Emission guard ---
+                # Check whether the preliminary normalised flux shows
+                # emission (flux > continuum) near the line centre.
+                # If so, skip subtraction — the Lorentzian cannot model
+                # emission and would produce a degenerate fit.
+                flux_norm_prelim = np.asarray(
+                    result.get("flux_norm", []), dtype=float
+                )
+                if flux_norm_prelim.size == wave.size:
+                    near_centre = (
+                        np.abs(wave - centre) < 5.0  # within ~5 A
+                    ) & np.isfinite(flux_norm_prelim)
+                    if (
+                        np.count_nonzero(near_centre) >= 3
+                        and float(np.nanmedian(flux_norm_prelim[near_centre]))
+                        > 1.05
+                    ):
+                        # Line is in emission — skip subtraction.
+                        continue
+
+                abs_profile, _meta = _fit_absorption_lorentzian(
+                    wave,
+                    flux,
+                    centre_hint=float(centre),
+                    fwhm_hint=(
+                        float(fwhm_hint) if fwhm_hint is not None else None
+                    ),
+                    ivar=ivar,
+                    fit_range=fit_range,
+                )
+                total_absorption += abs_profile
+
+            # Wing-corrected flux: add back what the Balmer wings absorbed.
+            corrected_flux = flux + total_absorption
+
+            # Build mask for the refit: base_mask + Balmer core FWHM mask.
+            base_mask = np.asarray(result["base_mask"], dtype=bool)
+            refit_mask = base_mask.copy()
+            fwhm_mask = result.get("fwhm_mask")
+            if (
+                isinstance(fwhm_mask, np.ndarray)
+                and fwhm_mask.shape == base_mask.shape
+            ):
+                refit_mask &= fwhm_mask
+
+            # Refit the sigma-clip spline on the corrected flux.
+            new_cont, _ = continuum_fit_func(
+                wave,
+                corrected_flux,
+                base_mask=refit_mask,
+                adaptive_smooth=False,
+                **cfit_kw,
+            )
+            new_cont = np.asarray(new_cont, dtype=float)
 
         else:
             raise ValueError(f"Unknown fit_mode: {fit_mode!r}")

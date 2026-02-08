@@ -909,6 +909,22 @@ def main() -> None:
 
             # ----- Fit-stage replacement (if not "standard") -----
             if method.fit_mode != "standard":
+                # For balmer_subtract, pass the sigma-clip spline fitter.
+                bs_kwargs: dict = {}
+                if method.fit_mode == "balmer_subtract":
+                    bs_kwargs["continuum_fit_func"] = continuum_iterative_sigma_clip
+                    bs_kwargs["continuum_fit_kwargs"] = dict(
+                        win_kms=args.win_kms,
+                        min_win_px=args.min_win_px,
+                        sigma_lower=args.sigma_lower,
+                        sigma_upper=args.sigma_upper,
+                        n_iter=args.n_iter,
+                        spline_order=args.spline_order,
+                        smooth_scale=args.smooth_scale,
+                        use_mad=args.use_mad,
+                        telluric_masks=None,
+                        eps=1e-12,
+                    )
                 apply_fitstage_to_balmer_windows(
                     method.fit_mode,
                     window_results,
@@ -922,6 +938,7 @@ def main() -> None:
                     pu_keep_frac=args.pu_keep_frac,
                     pu_smooth=args.pu_smooth,
                     pu_init_smooth=args.pu_init_smooth,
+                    **bs_kwargs,
                 )
 
             apply_method_renorm(
