@@ -17,6 +17,8 @@ from scipy.ndimage import gaussian_filter1d
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from fit_stage_methods import apply_fitstage_to_balmer_windows  # type: ignore
+
 
 C_KMS = 299_792.458
 
@@ -67,6 +69,7 @@ HDELTA_GROUP_BASE_LINES = ["HDELTA", "HEI4143", "HEI4144"]
 HGAMMA_GROUP_BASE_LINES = ["HGAMMA", "HEI4387", "NIII4379"]
 HEI4471_GROUP_BASE_LINES = ["HEI4471", "HEII4541"]
 HEII4686_GROUP_BASE_LINES = ["HEII4686", "NIIItrip", "CIII4650"]
+FIT_STAGE_CHOICES = ["standard", "balmer_subtract"]
 
 
 def import_hotstars_normalisation(hotstars_code: Path):
@@ -716,6 +719,7 @@ class LocalBOSSSpectraProcessor:
         balmer_mask_k: float | None,
         balmer_mask_stage: str,
         balmer_mask_smooth: float,
+        fit_stage: str,
     ):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
@@ -748,10 +752,15 @@ class LocalBOSSSpectraProcessor:
         self.balmer_mask_k = balmer_mask_k
         self.balmer_mask_stage = balmer_mask_stage
         self.balmer_mask_smooth = balmer_mask_smooth
+        self.fit_stage = str(fit_stage).lower()
+        if self.fit_stage not in FIT_STAGE_CHOICES:
+            raise ValueError(f"Unknown fit stage: {fit_stage!r}")
         if self.p98_renorm:
             self.normalisation_label = "local_line_windows_p98"
         else:
             self.normalisation_label = "local_line_windows"
+        if self.fit_stage != "standard":
+            self.normalisation_label = f"{self.normalisation_label}_{self.fit_stage}"
         if not merge_windows:
             self.normalisation_label = f"{self.normalisation_label}_per_line"
 
@@ -825,6 +834,28 @@ class LocalBOSSSpectraProcessor:
             eps=1e-12,
             balmer_mask=balmer_mask,
         )
+        if self.fit_stage != "standard":
+            bs_kwargs = {}
+            if self.fit_stage == "balmer_subtract":
+                bs_kwargs["continuum_fit_func"] = self.continuum_iterative_sigma_clip
+                bs_kwargs["continuum_fit_kwargs"] = dict(
+                    win_kms=self.win_kms,
+                    min_win_px=self.min_win_px,
+                    sigma_lower=self.sigma_lower,
+                    sigma_upper=self.sigma_upper,
+                    n_iter=self.n_iter,
+                    spline_order=self.spline_order,
+                    smooth_scale=self.smooth_scale,
+                    use_mad=self.use_mad,
+                    telluric_masks=self.telluric_masks,
+                    eps=1e-12,
+                )
+            apply_fitstage_to_balmer_windows(
+                self.fit_stage,
+                window_results,
+                self.line_windows,
+                **bs_kwargs,
+            )
         if self.p98_renorm:
             for result in window_results:
                 wave_win = result["wave"]
@@ -985,6 +1016,7 @@ class LocalBOSSSpectraProcessor:
                         grp.attrs["original_file"] = str(fits_path)
                         grp.attrs["processed_time"] = time.time()
                         grp.attrs["normalisation"] = self.normalisation_label
+                        grp.attrs["fit_stage"] = self.fit_stage
                         grp.attrs["output_format"] = "windowed"
                         grp.attrs["spec_file"] = spec_file
                         if sdss_id is not None:
@@ -1144,6 +1176,13 @@ def main() -> None:
         default=2.0,
         help="Gaussian smoothing sigma (pixels) for Balmer FWHM estimation.",
     )
+    parser.add_argument(
+        "--fit-stage",
+        type=str,
+        default="standard",
+        choices=FIT_STAGE_CHOICES,
+        help="Balmer fit-stage strategy applied before optional p98 renorm.",
+    )
     parser.add_argument("--store-continuum", action="store_true", help="Store continuum arrays in HDF5.")
     parser.add_argument("--max-spectra", type=int, default=None, help="Total spectra cap for quick tests.")
     parser.add_argument("--max-per-field", type=int, default=None, help="Per-field spectra cap.")
@@ -1248,6 +1287,7 @@ def main() -> None:
             "renorm_percentile": args.renorm_percentile,
             "spike_sigma": args.spike_sigma,
             "smooth_sigma_px": args.smooth_sigma,
+            "fit_stage": args.fit_stage,
         },
     }
     if args.balmer_mask_k is not None and args.balmer_mask_k > 0:
@@ -1294,6 +1334,7 @@ def main() -> None:
         balmer_mask_k=args.balmer_mask_k,
         balmer_mask_stage=args.balmer_mask_stage,
         balmer_mask_smooth=args.balmer_mask_smooth,
+        fit_stage=args.fit_stage,
     )
     processor.process_all_fields(field_filter=field_filter)
 
