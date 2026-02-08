@@ -82,6 +82,25 @@ def list_pilot_specs(fig_dir: Path) -> list[str]:
     return specs
 
 
+def load_spec_list(path: Path) -> list[str]:
+    raw = path.read_text(encoding="utf-8").splitlines()
+    specs = [line.strip() for line in raw if line.strip() and not line.strip().startswith("#")]
+    if not specs:
+        raise RuntimeError(f"No spectrum names found in {path}")
+    return specs
+
+
+def dedupe_keep_order(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
 def load_lines(lines_file: Path | None) -> list[str]:
     if lines_file is None:
         return DEFAULT_LINES.copy()
@@ -717,13 +736,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate Balmer renorm methods on pilot spectra.")
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--full-dir", type=Path, default=DEFAULT_FULL_DIR)
-    parser.add_argument("--pilot-source-dir", type=Path, default=DEFAULT_PILOT_SOURCE_DIR)
+    parser.add_argument(
+        "--pilot-source-dir",
+        type=Path,
+        default=DEFAULT_PILOT_SOURCE_DIR,
+        help="Fallback plot folder used only when no explicit spec list is given.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--spec-names",
         nargs="*",
         default=None,
         help="Optional explicit spectrum names (spec-...) to evaluate.",
+    )
+    parser.add_argument(
+        "--spec-list-file",
+        type=Path,
+        default=None,
+        help="Optional text file with one spectrum name per line.",
     )
     parser.add_argument(
         "--max-specs",
@@ -818,14 +848,15 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "plots").mkdir(parents=True, exist_ok=True)
 
-    pilot_specs = list_pilot_specs(args.pilot_source_dir)
+    requested_specs: list[str] = []
+    if args.spec_list_file is not None:
+        requested_specs.extend(load_spec_list(args.spec_list_file))
     if args.spec_names:
-        requested = [item.strip() for item in args.spec_names if item.strip()]
-        requested_set = set(requested)
-        pilot_specs = [spec for spec in pilot_specs if spec in requested_set]
-        missing = [spec for spec in requested if spec not in set(pilot_specs)]
-        if missing:
-            print(f"[warn] requested spectra not found in pilot source: {', '.join(missing)}")
+        requested_specs.extend([item.strip() for item in args.spec_names if item.strip()])
+    if requested_specs:
+        pilot_specs = dedupe_keep_order(requested_specs)
+    else:
+        pilot_specs = list_pilot_specs(args.pilot_source_dir)
     if args.max_specs is not None:
         pilot_specs = pilot_specs[: max(0, int(args.max_specs))]
     if not pilot_specs:
