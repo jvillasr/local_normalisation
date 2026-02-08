@@ -169,11 +169,15 @@ Final validation on all pilot stars, commit `011bb15`.
 
 **Failure analysis:** The 2 regression stars (spec-016340-59629-27021597912074303, spec-017153-59638-27021598086034093) show small abs_bias increases (0.004-0.013) but remain within acceptable tolerances. These likely represent edge cases where Lorentzian template is suboptimal; future iterations could explore iterative refinement or alternative line profiles.
 
+## Production integration status
+- 2026-02-08: Completed. `scripts/local_normalise_boss_spectra.py` now
+  exposes `--fit-stage {standard,balmer_subtract}` and applies
+  `balmer_subtract` during fit-stage before optional p98 renormalisation.
+
 **Next steps:**
-1. Integrate `balmer_subtract` fit_mode into production `local_normalise_boss_spectra.py` pipeline as `--fit-stage` option
-2. Run scale-up validation on 50-100 stars to confirm generalisation
-3. Deploy to full field set
-4. Re-evaluate multiplicity signal with improved local normalisation
+1. Run scale-up validation on 50-100 stars to confirm generalisation
+2. Deploy to full field set
+3. Re-evaluate multiplicity signal with improved local normalisation
 
 ## Reproducibility
 
