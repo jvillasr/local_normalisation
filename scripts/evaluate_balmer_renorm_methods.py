@@ -956,6 +956,7 @@ def main() -> None:
                         telluric_masks=None,
                         eps=1e-12,
                     )
+                    bs_kwargs["use_fwhm_mask"] = method.balmer_mask_stage in {"fit", "fit+p98"}
                 apply_fitstage_to_balmer_windows(
                     method.fit_mode,
                     window_results,

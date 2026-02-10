@@ -328,6 +328,8 @@ BALMER_CENTRES = {
 }
 
 BALMER_LINES = ["HDELTA", "HGAMMA", "HBETA", "HALPHA"]
+BSUB_BLUE_JUMP_THRESHOLD = 1.0
+BSUB_MASK_K_FALLBACKS = (1.0, 0.5, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +419,78 @@ def _fit_absorption_lorentzian(
     return absorption, meta
 
 
+def _derivative_jump(
+    wave: np.ndarray,
+    series: np.ndarray,
+    boundary: float,
+    *,
+    left_width: float = 2.0,
+    right_width: float = 2.0,
+) -> float:
+    """Estimate derivative jump across a boundary."""
+    valid = np.isfinite(wave) & np.isfinite(series)
+    if np.count_nonzero(valid) < 6:
+        return float("nan")
+    w = wave[valid]
+    y = series[valid]
+    grad = np.gradient(y, w)
+    left = (w >= boundary - left_width) & (w < boundary - 0.2)
+    right = (w > boundary + 0.2) & (w <= boundary + right_width)
+    if np.count_nonzero(left) < 2 or np.count_nonzero(right) < 2:
+        return float("nan")
+    return float(np.nanmedian(grad[right]) - np.nanmedian(grad[left]))
+
+
+def _build_balmer_core_mask(
+    wave: np.ndarray,
+    base_mask: np.ndarray,
+    line_meta: dict[str, dict[str, float]],
+    *,
+    k: float,
+) -> np.ndarray:
+    """Build a mask excluding +/- 0.5*k*FWHM around Balmer line centres."""
+    mask = np.asarray(base_mask, dtype=bool).copy()
+    if k <= 0:
+        return mask
+    for meta in line_meta.values():
+        ctr = float(meta["centre"])
+        fwhm = float(meta["fwhm"])
+        if not np.isfinite(ctr) or not np.isfinite(fwhm) or fwhm <= 0:
+            continue
+        half = 0.5 * float(k) * fwhm
+        lo = ctr - half
+        hi = ctr + half
+        mask &= ~((wave >= lo) & (wave <= hi))
+    return mask
+
+
+def _blue_boundary_kink(
+    wave: np.ndarray,
+    continuum: np.ndarray,
+    line_meta: dict[str, dict[str, float]],
+    *,
+    k: float,
+) -> float:
+    """
+    Return the maximum absolute derivative jump at Balmer blue boundaries.
+    """
+    if k <= 0 or not line_meta:
+        return float("nan")
+    jumps: list[float] = []
+    for meta in line_meta.values():
+        ctr = float(meta["centre"])
+        fwhm = float(meta["fwhm"])
+        if not np.isfinite(ctr) or not np.isfinite(fwhm) or fwhm <= 0:
+            continue
+        blue = ctr - 0.5 * float(k) * fwhm
+        jump = _derivative_jump(wave, continuum, blue)
+        if np.isfinite(jump):
+            jumps.append(abs(float(jump)))
+    if not jumps:
+        return float("nan")
+    return float(np.nanmax(jumps))
+
+
 def apply_fitstage_to_balmer_windows(
     fit_mode: str,
     window_results: list[dict[str, object]],
@@ -437,6 +511,7 @@ def apply_fitstage_to_balmer_windows(
     # balmer_subtract: needs the sigma-clip continuum fitter
     continuum_fit_func: object | None = None,
     continuum_fit_kwargs: dict | None = None,
+    use_fwhm_mask: bool = True,
 ) -> None:
     """
     Replace the continuum in Balmer windows using the specified fit-stage
@@ -454,6 +529,9 @@ def apply_fitstage_to_balmer_windows(
     continuum_fit_kwargs : dict
         Keyword arguments for *continuum_fit_func* (only needed for
         ``"balmer_subtract"``).
+    use_fwhm_mask : bool
+        If true, ``"balmer_subtract"`` may use Balmer-core FWHM masks during
+        refit. If false, the refit always uses the full base mask.
     """
     if fit_mode == "standard":
         return
@@ -623,25 +701,155 @@ def apply_fitstage_to_balmer_windows(
             # Wing-corrected flux: add back what the Balmer wings absorbed.
             corrected_flux = flux + total_absorption
 
-            # Build mask for the refit: base_mask + Balmer core FWHM mask.
+            # Build mask for the refit. For problematic stars we may adaptively
+            # relax the Balmer-core mask if the blue-edge derivative jump is
+            # too large.
             base_mask = np.asarray(result["base_mask"], dtype=bool)
-            refit_mask = base_mask.copy()
-            fwhm_mask = result.get("fwhm_mask")
-            if (
-                isinstance(fwhm_mask, np.ndarray)
-                and fwhm_mask.shape == base_mask.shape
-            ):
-                refit_mask &= fwhm_mask
+            fwhm_meta = result.get("fwhm_meta")
+            line_meta: dict[str, dict[str, float]] = {}
+            nominal_k = float("nan")
+            if isinstance(fwhm_meta, dict):
+                try:
+                    nominal_k = float(fwhm_meta.get("k", float("nan")))
+                except Exception:
+                    nominal_k = float("nan")
+                lines_meta = fwhm_meta.get("lines", {})
+                if isinstance(lines_meta, dict):
+                    for line_name, meta_obj in lines_meta.items():
+                        if not isinstance(meta_obj, dict):
+                            continue
+                        try:
+                            ctr = float(meta_obj.get("centre", float("nan")))
+                            fwhm = float(meta_obj.get("fwhm", float("nan")))
+                        except Exception:
+                            continue
+                        if np.isfinite(ctr) and np.isfinite(fwhm) and fwhm > 0:
+                            line_meta[str(line_name)] = {"centre": ctr, "fwhm": fwhm}
 
-            # Refit the sigma-clip spline on the corrected flux.
-            new_cont, _ = continuum_fit_func(
-                wave,
-                corrected_flux,
-                base_mask=refit_mask,
-                adaptive_smooth=False,
-                **cfit_kw,
-            )
-            new_cont = np.asarray(new_cont, dtype=float)
+            min_fit_points = int(cfit_kw.get("min_win_px", 21))
+            mask_trials: list[dict[str, object]] = []
+
+            if use_fwhm_mask and line_meta and np.isfinite(nominal_k) and nominal_k > 0:
+                k_trials: list[float] = [float(nominal_k)]
+                for k_alt in BSUB_MASK_K_FALLBACKS:
+                    if (k_alt < nominal_k - 1e-6) and (k_alt not in k_trials):
+                        k_trials.append(float(k_alt))
+                if 0.0 not in k_trials:
+                    k_trials.append(0.0)
+                for k_trial in k_trials:
+                    mask_trials.append(
+                        {
+                            "mode": "k_trial",
+                            "k": float(k_trial),
+                            "mask": _build_balmer_core_mask(
+                                wave,
+                                base_mask,
+                                line_meta,
+                                k=float(k_trial),
+                            ),
+                        }
+                    )
+            else:
+                if use_fwhm_mask:
+                    fwhm_mask = result.get("fwhm_mask")
+                    if isinstance(fwhm_mask, np.ndarray) and fwhm_mask.shape == base_mask.shape:
+                        mask_trials.append(
+                            {
+                                "mode": "provided_mask",
+                                "k": float("nan"),
+                                "mask": base_mask & fwhm_mask,
+                            }
+                        )
+                mask_trials.append({"mode": "no_mask", "k": 0.0, "mask": base_mask.copy()})
+
+            attempts: list[dict[str, float | int | str]] = []
+            successful: list[tuple[float, np.ndarray, dict[str, float | int | str]]] = []
+            for trial in mask_trials:
+                trial_mask = np.asarray(trial["mask"], dtype=bool)
+                n_fit = int(np.count_nonzero(trial_mask & np.isfinite(corrected_flux)))
+                trial_info: dict[str, float | int | str] = {
+                    "mode": str(trial["mode"]),
+                    "k": float(trial["k"]),
+                    "n_fit": n_fit,
+                }
+                if n_fit < max(min_fit_points, 8):
+                    trial_info["status"] = "insufficient_points"
+                    attempts.append(trial_info)
+                    continue
+
+                try:
+                    cont_trial, _ = continuum_fit_func(
+                        wave,
+                        corrected_flux,
+                        base_mask=trial_mask,
+                        adaptive_smooth=False,
+                        **cfit_kw,
+                    )
+                except Exception:
+                    trial_info["status"] = "fit_failed"
+                    attempts.append(trial_info)
+                    continue
+
+                cont_trial = np.asarray(cont_trial, dtype=float)
+                blue_kink = _blue_boundary_kink(
+                    wave,
+                    cont_trial,
+                    line_meta,
+                    k=float(trial["k"]),
+                )
+                trial_info["status"] = "ok"
+                trial_info["blue_kink"] = (
+                    float(blue_kink) if np.isfinite(blue_kink) else float("nan")
+                )
+                attempts.append(trial_info)
+
+                if np.isfinite(blue_kink):
+                    score = abs(float(blue_kink))
+                elif float(trial["k"]) <= 0:
+                    score = 0.0
+                else:
+                    score = float("inf")
+                successful.append((score, cont_trial, trial_info))
+
+            chosen_cont: np.ndarray | None = None
+            chosen_info: dict[str, float | int | str] | None = None
+            for _score, cont_trial, info in successful:
+                blue_kink = info.get("blue_kink")
+                if (
+                    not isinstance(blue_kink, float)
+                    or not np.isfinite(blue_kink)
+                    or blue_kink <= BSUB_BLUE_JUMP_THRESHOLD
+                ):
+                    chosen_cont = cont_trial
+                    chosen_info = info
+                    break
+
+            if chosen_cont is None and successful:
+                best = min(successful, key=lambda item: item[0])
+                chosen_cont = best[1]
+                chosen_info = best[2]
+
+            if chosen_cont is None:
+                chosen_cont, _ = continuum_fit_func(
+                    wave,
+                    corrected_flux,
+                    base_mask=base_mask,
+                    adaptive_smooth=False,
+                    **cfit_kw,
+                )
+                chosen_cont = np.asarray(chosen_cont, dtype=float)
+                chosen_info = {"mode": "fallback_no_mask", "k": 0.0, "status": "ok"}
+
+            if isinstance(result.get("meta"), dict):
+                result["meta"]["balmer_subtract_refit"] = {
+                    "blue_kink_threshold": float(BSUB_BLUE_JUMP_THRESHOLD),
+                    "chosen_mode": str(chosen_info.get("mode", "unknown")),
+                    "chosen_k": float(chosen_info.get("k", float("nan"))),
+                    "chosen_blue_kink": float(chosen_info.get("blue_kink", float("nan"))),
+                    "attempts": attempts,
+                }
+
+            new_cont = chosen_cont
 
         else:
             raise ValueError(f"Unknown fit_mode: {fit_mode!r}")

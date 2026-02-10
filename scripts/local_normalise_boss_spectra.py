@@ -627,10 +627,11 @@ def renorm_p98_continuum(
     extra_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     lo, hi = line_range
-    mask = base_mask & (wave >= lo) & (wave <= hi)
-    if extra_mask is not None and extra_mask.shape == mask.shape:
-        mask &= extra_mask
-    ratio = flux[mask] / np.clip(continuum[mask], 1e-12, None)
+    in_range = (wave >= lo) & (wave <= hi)
+    sample_mask = base_mask & in_range
+    if extra_mask is not None and extra_mask.shape == sample_mask.shape:
+        sample_mask &= extra_mask
+    ratio = flux[sample_mask] / np.clip(continuum[sample_mask], 1e-12, None)
     ratio = ratio[np.isfinite(ratio)]
     if smooth_sigma_px and ratio.size > 3:
         ratio = gaussian_filter1d(ratio, sigma=float(smooth_sigma_px), mode="nearest")
@@ -643,7 +644,10 @@ def renorm_p98_continuum(
     scale = np.nanpercentile(ratio, renorm_percentile) if ratio.size else np.nan
     cont = continuum.copy()
     if np.isfinite(scale) and scale > 0:
-        cont[mask] = continuum[mask] * scale
+        # Apply the scalar renorm consistently across the whole line range to
+        # avoid artificial steps where base_mask/extra_mask boundaries fall.
+        apply_mask = in_range & np.isfinite(continuum)
+        cont[apply_mask] = continuum[apply_mask] * scale
     return cont
 
 
@@ -850,6 +854,7 @@ class LocalBOSSSpectraProcessor:
                     telluric_masks=self.telluric_masks,
                     eps=1e-12,
                 )
+                bs_kwargs["use_fwhm_mask"] = self.balmer_mask_stage in {"fit", "fit+p98"}
             apply_fitstage_to_balmer_windows(
                 self.fit_stage,
                 window_results,
