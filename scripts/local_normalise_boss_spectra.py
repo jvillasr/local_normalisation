@@ -870,6 +870,20 @@ class LocalBOSSSpectraProcessor:
                 extra_mask = None
                 if balmer_mask is not None and self.balmer_mask_stage in {"p98", "fit+p98"}:
                     extra_mask = result.get("fwhm_mask")
+                # For Balmer windows where any line is in emission, always
+                # exclude the emission core from the p98 percentile regardless
+                # of balmer_mask_stage.  Without this, the emission peak biases
+                # the percentile upward and the continuum is scaled to match the
+                # peak, which suppresses the emission in the normalised spectrum.
+                if extra_mask is None:
+                    _fwhm_meta = result.get("fwhm_meta")
+                    if isinstance(_fwhm_meta, dict):
+                        _lines_meta = _fwhm_meta.get("lines", {})
+                        if isinstance(_lines_meta, dict) and any(
+                            isinstance(_lm, dict) and _lm.get("kind") == "emission"
+                            for _lm in _lines_meta.values()
+                        ):
+                            extra_mask = result.get("fwhm_mask")
                 cont = renorm_p98_continuum(
                     wave_win,
                     flux_win,
