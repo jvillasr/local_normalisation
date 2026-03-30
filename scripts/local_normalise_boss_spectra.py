@@ -260,21 +260,36 @@ def estimate_fwhm_from_norm(
 
     f_min = float(np.min(f))
     f_max = float(np.max(f))
-    if f_min < 1.0 - eps:
-        half_level = 1.0 - 0.5 * (1.0 - f_min)
-        select = f <= half_level
-        centre = w[int(np.argmin(f))]
-        kind = "absorption"
-    elif f_max > 1.0 + eps:
-        half_level = 1.0 + 0.5 * (f_max - 1.0)
-        select = f >= half_level
-        centre = w[int(np.argmax(f))]
-        kind = "emission"
-    else:
-        return None, None, None
+
+    # When centre_hint is provided, check emission at the hint location first.
+    # Without this, a CII absorption line or noise dip elsewhere in a broad
+    # H-alpha window causes f_min < 1.0 and the whole window is mis-classified
+    # as absorption even when H-alpha itself is in emission.
+    kind: str | None = None
+    select: np.ndarray | None = None
+    centre: float = float(centre_hint) if (centre_hint is not None and np.isfinite(centre_hint)) else float(w[len(w) // 2])
 
     if centre_hint is not None and np.isfinite(centre_hint):
-        centre = centre_hint
+        near_hint = np.abs(w - float(centre_hint)) < 5.0
+        if near_hint.sum() >= 2 and float(np.nanmedian(f[near_hint])) > 1.0 + eps:
+            local_max = float(np.nanmax(f[near_hint]))
+            half_level = 1.0 + 0.5 * (local_max - 1.0)
+            select = f >= half_level
+            kind = "emission"
+
+    if kind is None:
+        if f_min < 1.0 - eps:
+            half_level = 1.0 - 0.5 * (1.0 - f_min)
+            select = f <= half_level
+            centre = w[int(np.argmin(f))]
+            kind = "absorption"
+        elif f_max > 1.0 + eps:
+            half_level = 1.0 + 0.5 * (f_max - 1.0)
+            select = f >= half_level
+            centre = w[int(np.argmax(f))]
+            kind = "emission"
+        else:
+            return None, None, None
 
     if select.sum() < 2:
         return None, None, kind
