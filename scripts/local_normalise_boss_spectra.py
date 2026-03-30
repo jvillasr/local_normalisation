@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import sys
 import time
@@ -780,8 +781,6 @@ class LocalBOSSSpectraProcessor:
             self.registry_file = self.output_dir / "processed_registry.parquet"
             self.registry = pd.DataFrame()
 
-        self._processed_total = 0
-
     def _prepare_registry(self) -> None:
         required = ["field", "spectrum_name", "spec_file", "sdss_id", "processed_time", "h5_file"]
         for col in required:
@@ -795,6 +794,15 @@ class LocalBOSSSpectraProcessor:
                     return f"{name[name.find('spec-'): ]}.fits"
                 return None
             self.registry["spec_file"] = self.registry["spectrum_name"].map(infer_spec_file)
+
+    def _existing_registry_lookup(self) -> dict[str, set[str]]:
+        lookup: dict[str, set[str]] = {}
+        if self.registry.empty:
+            return lookup
+        grouped = self.registry.dropna(subset=["field", "spec_file"]).groupby("field")["spec_file"]
+        for field, spec_files in grouped:
+            lookup[str(field)] = set(spec_files.astype(str).tolist())
+        return lookup
 
     def save_registry(self) -> None:
         self.registry.to_parquet(self.registry_file, index=False)
@@ -937,12 +945,28 @@ class LocalBOSSSpectraProcessor:
         fig.savefig(out_path, dpi=180, bbox_inches="tight")
         plt.close(fig)
 
-    def process_field(self, field_dir: Path) -> None:
+    def process_field(
+        self,
+        field_dir: Path,
+        *,
+        existing_spec_files: set[str] | None = None,
+        remaining_total: int | None = None,
+    ) -> dict[str, object]:
         field_name = field_dir.name
         if self.allowed_spectra is not None and field_name not in self.allowed_spectra:
-            return
+            return {
+                "field": field_name,
+                "processed_count": 0,
+                "failed_count": 0,
+                "updates": pd.DataFrame(
+                    columns=["field", "spectrum_name", "spec_file", "sdss_id", "processed_time", "h5_file"]
+                ),
+            }
         output_file = self.output_dir / f"{field_name}.h5"
         processed_here = 0
+        failed_here = 0
+        new_rows: list[dict[str, object]] = []
+        existing_spec_files = existing_spec_files or set()
 
         h5f = None
         if self.write_output:
@@ -964,7 +988,7 @@ class LocalBOSSSpectraProcessor:
                         print(f"[missing] {fits_path}")
 
             for fits_path in fits_paths:
-                if self.max_spectra is not None and self._processed_total >= self.max_spectra:
+                if remaining_total is not None and processed_here >= remaining_total:
                     break
                 if self.max_per_field is not None and processed_here >= self.max_per_field:
                     break
@@ -982,15 +1006,10 @@ class LocalBOSSSpectraProcessor:
                 else:
                     group_name = spec_name
 
-                if self.write_output:
-                    already = (
-                        (self.registry["field"] == field_name)
-                        & (self.registry["spec_file"] == spec_file)
-                    )
-                    if already.any() and not self.overwrite:
-                        continue
-                    if already.any() and self.overwrite:
-                        self.registry = self.registry.loc[~already].reset_index(drop=True)
+                if spec_file in existing_spec_files and not self.overwrite:
+                    continue
+                if h5f is not None and group_name in h5f and not self.overwrite:
+                    continue
 
                 try:
                     window_results, group_meta = self.process_spectrum(fits_path)
@@ -1028,36 +1047,36 @@ class LocalBOSSSpectraProcessor:
                             grp.attrs["sdss_id"] = sdss_id
                         grp.attrs["line_groups_json"] = json.dumps(group_meta)
 
-                        self.registry = pd.concat(
-                            [
-                                self.registry,
-                                pd.DataFrame(
-                                    [
-                                        {
-                                            "field": field_name,
-                                            "spectrum_name": group_name,
-                                            "spec_file": spec_file,
-                                            "sdss_id": sdss_id,
-                                            "processed_time": grp.attrs["processed_time"],
-                                            "h5_file": output_file.name,
-                                        }
-                                    ]
-                                ),
-                            ],
-                            ignore_index=True,
+                        new_rows.append(
+                            {
+                                "field": field_name,
+                                "spectrum_name": group_name,
+                                "spec_file": spec_file,
+                                "sdss_id": sdss_id,
+                                "processed_time": grp.attrs["processed_time"],
+                                "h5_file": output_file.name,
+                            }
                         )
                         processed_here += 1
 
-                    self._processed_total += 1
                 except Exception as exc:
+                    failed_here += 1
                     print(f"Failed to process {fits_path}: {exc}")
         if h5f is not None:
             h5f.close()
 
-        if self.write_output and processed_here:
-            self.save_registry()
+        updates = pd.DataFrame(
+            new_rows,
+            columns=["field", "spectrum_name", "spec_file", "sdss_id", "processed_time", "h5_file"],
+        )
+        return {
+            "field": field_name,
+            "processed_count": processed_here,
+            "failed_count": failed_here,
+            "updates": updates,
+        }
 
-    def process_all_fields(self, field_filter: list[str] | None = None) -> None:
+    def process_all_fields(self, field_filter: list[str] | None = None, max_workers: int = 1) -> None:
         if self.allowed_spectra is None:
             field_dirs = sorted([d for d in self.input_dir.iterdir() if d.is_dir()])
         else:
@@ -1068,12 +1087,98 @@ class LocalBOSSSpectraProcessor:
                     if (self.input_dir / field).is_dir()
                 ]
             )
-        for field_dir in field_dirs:
-            if field_filter and field_dir.name not in field_filter:
-                continue
-            if self.max_spectra is not None and self._processed_total >= self.max_spectra:
-                break
-            self.process_field(field_dir)
+        if field_filter:
+            field_dirs = [field_dir for field_dir in field_dirs if field_dir.name in field_filter]
+
+        total_fields = len(field_dirs)
+        if max_workers < 1:
+            raise ValueError("max_workers must be >= 1")
+        if max_workers > 1 and self.max_spectra is not None:
+            print("Parallel mode disabled because --max-spectra requires an exact global cap; using 1 worker.")
+            max_workers = 1
+        if max_workers > 1 and self.plot_dir is not None:
+            print("Parallel mode disabled because Matplotlib plotting is not thread-safe here; using 1 worker.")
+            max_workers = 1
+
+        existing_lookup = self._existing_registry_lookup()
+        registry_updates: list[pd.DataFrame] = []
+        processed_total = 0
+        failed_spectra = 0
+        completed_fields = 0
+        failed_fields = 0
+
+        print(f"Found {total_fields} fields")
+
+        def collect_result(result: dict[str, object]) -> None:
+            nonlocal processed_total, failed_spectra
+            updates = result["updates"]
+            if isinstance(updates, pd.DataFrame) and not updates.empty:
+                registry_updates.append(updates)
+            processed_total += int(result["processed_count"])
+            failed_spectra += int(result["failed_count"])
+
+        if max_workers == 1:
+            for field_dir in field_dirs:
+                if self.max_spectra is not None and processed_total >= self.max_spectra:
+                    break
+                remaining_total = None
+                if self.max_spectra is not None:
+                    remaining_total = self.max_spectra - processed_total
+                try:
+                    result = self.process_field(
+                        field_dir,
+                        existing_spec_files=existing_lookup.get(field_dir.name, set()),
+                        remaining_total=remaining_total,
+                    )
+                    collect_result(result)
+                    completed_fields += 1
+                    print(
+                        f"Completed field {field_dir.name}: "
+                        f"{int(result['processed_count'])} spectra, {int(result['failed_count'])} failures"
+                    )
+                except Exception as exc:
+                    failed_fields += 1
+                    print(f"Failed field {field_dir.name}: {exc}")
+        else:
+            print(f"Processing fields in parallel with {max_workers} workers")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_field = {
+                    executor.submit(
+                        self.process_field,
+                        field_dir,
+                        existing_spec_files=existing_lookup.get(field_dir.name, set()),
+                    ): field_dir.name
+                    for field_dir in field_dirs
+                }
+                for future in concurrent.futures.as_completed(future_to_field):
+                    field_name = future_to_field[future]
+                    try:
+                        result = future.result()
+                        collect_result(result)
+                        completed_fields += 1
+                        print(
+                            f"Completed field {field_name}: "
+                            f"{int(result['processed_count'])} spectra, {int(result['failed_count'])} failures"
+                        )
+                    except Exception as exc:
+                        failed_fields += 1
+                        print(f"Failed field {field_name}: {exc}")
+
+        if registry_updates:
+            self.registry = pd.concat([self.registry, *registry_updates], ignore_index=True)
+            self.registry = self.registry.drop_duplicates(
+                subset=["field", "spec_file"],
+                keep="last",
+            ).reset_index(drop=True)
+        if self.write_output:
+            self.save_registry()
+
+        print("\nProcessing summary:")
+        print(f"Fields scheduled: {total_fields}")
+        print(f"Fields completed: {completed_fields}")
+        print(f"Fields failed: {failed_fields}")
+        print(f"Spectra processed: {processed_total}")
+        print(f"Spectra failed: {failed_spectra}")
 
 
 def main() -> None:
@@ -1215,6 +1320,12 @@ def main() -> None:
         default=None,
         help="Comma-separated field directory names to process (default: all).",
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=1,
+        help="Number of field directories to process in parallel.",
+    )
 
     args = parser.parse_args()
 
@@ -1274,6 +1385,7 @@ def main() -> None:
         "plot": bool(args.plot),
         "plot_dir": None if plot_dir is None else str(plot_dir),
         "plot_lines": plot_lines,
+        "max_workers": args.max_workers,
         "groups": groups,
         "overwrite": args.overwrite,
         "normalisation": {
@@ -1341,7 +1453,7 @@ def main() -> None:
         balmer_mask_smooth=args.balmer_mask_smooth,
         fit_stage=args.fit_stage,
     )
-    processor.process_all_fields(field_filter=field_filter)
+    processor.process_all_fields(field_filter=field_filter, max_workers=args.max_workers)
 
     print(f"Registry saved at {processor.registry_file}")
 
