@@ -59,7 +59,8 @@ class MethodConfig:
     renorm_mode: str  # none | p98 | wing_anchor | upper_envelope
     balmer_mask_k: float
     balmer_mask_stage: str
-    fit_mode: str = "standard"  # standard | quantile_spline | penalised_upper | lorentzian_deblend
+    fit_mode: str = "standard"  # standard | quantile_spline | penalised_upper | lorentzian_deblend | sideband_linear
+    sb_half_width: float | None = None  # per-method override for sideband_linear half-width
 
 
 def parse_field_from_spec_name(spec_name: str) -> str:
@@ -116,8 +117,13 @@ def read_full_spectrum(full_file: Path, spec_name: str) -> tuple[np.ndarray, np.
         if spec_name not in h5f:
             raise KeyError(f"{spec_name} not found in {full_file}")
         grp = h5f[spec_name]
-        wave = np.asarray(grp["wave"], dtype=float)
-        flux = np.asarray(grp["flux"], dtype=float)
+        # Full-spectrum HDF5 stores log10-wavelength as LOGLAM; convert to Å.
+        if "LOGLAM" in grp:
+            wave = 10.0 ** np.asarray(grp["LOGLAM"], dtype=float)
+            flux = np.asarray(grp["FLUX"], dtype=float)
+        else:
+            wave = np.asarray(grp["wave"], dtype=float)
+            flux = np.asarray(grp["flux"], dtype=float)
     return wave, flux
 
 
@@ -811,6 +817,7 @@ def main() -> None:
     parser.add_argument("--pu-keep-frac", type=float, default=0.3, help="Penalised upper: MAD fraction below to keep.")
     parser.add_argument("--pu-smooth", type=float, default=1.5, help="Penalised upper: smoothing sigma (px).")
     parser.add_argument("--pu-init-smooth", type=float, default=5.0, help="Penalised upper: initial smoothing (px).")
+    parser.add_argument("--sb-half-width", type=float, default=30.0, help="Sideband-linear: exclusion half-width in Angstroms (default 30).")
 
     parser.add_argument(
         "--methods",
@@ -824,7 +831,7 @@ def main() -> None:
             "pupper_k1p5_fit:none:1.5:fit:penalised_upper",
             "lordeblend_k1p5_fit:none:1.5:fit:lorentzian_deblend",
         ],
-        help="Method specs as name:renorm_mode:mask_k:mask_stage[:fit_mode]",
+        help="Method specs as name:renorm_mode:mask_k:mask_stage[:fit_mode[:sb_half_width]]",
     )
     parser.add_argument("--make-star-plots", action="store_true", default=True)
     parser.add_argument("--no-make-star-plots", dest="make_star_plots", action="store_false")
@@ -836,13 +843,18 @@ def main() -> None:
         if len(parts) == 4:
             name, mode, k, stage = parts
             fit_mode = "standard"
+            sb_hw: float | None = None
         elif len(parts) == 5:
             name, mode, k, stage, fit_mode = parts
+            sb_hw = None
+        elif len(parts) == 6:
+            name, mode, k, stage, fit_mode, sb_hw_str = parts
+            sb_hw = float(sb_hw_str)
         else:
-            raise ValueError(f"Bad method spec (expect 4 or 5 colon-separated fields): {spec!r}")
+            raise ValueError(f"Bad method spec (expect 4-6 colon-separated fields): {spec!r}")
         methods.append(MethodConfig(
             name=name, renorm_mode=mode, balmer_mask_k=float(k),
-            balmer_mask_stage=stage, fit_mode=fit_mode,
+            balmer_mask_stage=stage, fit_mode=fit_mode, sb_half_width=sb_hw,
         ))
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -940,9 +952,8 @@ def main() -> None:
 
             # ----- Fit-stage replacement (if not "standard") -----
             if method.fit_mode != "standard":
-                # For balmer_subtract, pass the sigma-clip spline fitter.
                 bs_kwargs: dict = {}
-                if method.fit_mode == "balmer_subtract":
+                if method.fit_mode in ("balmer_subtract", "sideband_linear"):
                     bs_kwargs["continuum_fit_func"] = continuum_iterative_sigma_clip
                     bs_kwargs["continuum_fit_kwargs"] = dict(
                         win_kms=args.win_kms,
@@ -956,6 +967,7 @@ def main() -> None:
                         telluric_masks=None,
                         eps=1e-12,
                     )
+                if method.fit_mode == "balmer_subtract":
                     bs_kwargs["use_fwhm_mask"] = method.balmer_mask_stage in {"fit", "fit+p98"}
                 apply_fitstage_to_balmer_windows(
                     method.fit_mode,
@@ -970,6 +982,7 @@ def main() -> None:
                     pu_keep_frac=args.pu_keep_frac,
                     pu_smooth=args.pu_smooth,
                     pu_init_smooth=args.pu_init_smooth,
+                    sb_half_width=method.sb_half_width if method.sb_half_width is not None else args.sb_half_width,
                     **bs_kwargs,
                 )
 
