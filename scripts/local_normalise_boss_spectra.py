@@ -260,36 +260,21 @@ def estimate_fwhm_from_norm(
 
     f_min = float(np.min(f))
     f_max = float(np.max(f))
-
-    # When centre_hint is provided, check emission at the hint location first.
-    # Without this, a CII absorption line or noise dip elsewhere in a broad
-    # H-alpha window causes f_min < 1.0 and the whole window is mis-classified
-    # as absorption even when H-alpha itself is in emission.
-    kind: str | None = None
-    select: np.ndarray | None = None
-    centre: float = float(centre_hint) if (centre_hint is not None and np.isfinite(centre_hint)) else float(w[len(w) // 2])
+    if f_min < 1.0 - eps:
+        half_level = 1.0 - 0.5 * (1.0 - f_min)
+        select = f <= half_level
+        centre = w[int(np.argmin(f))]
+        kind = "absorption"
+    elif f_max > 1.0 + eps:
+        half_level = 1.0 + 0.5 * (f_max - 1.0)
+        select = f >= half_level
+        centre = w[int(np.argmax(f))]
+        kind = "emission"
+    else:
+        return None, None, None
 
     if centre_hint is not None and np.isfinite(centre_hint):
-        near_hint = np.abs(w - float(centre_hint)) < 5.0
-        if near_hint.sum() >= 2 and float(np.nanmedian(f[near_hint])) > 1.0 + eps:
-            local_max = float(np.nanmax(f[near_hint]))
-            half_level = 1.0 + 0.5 * (local_max - 1.0)
-            select = f >= half_level
-            kind = "emission"
-
-    if kind is None:
-        if f_min < 1.0 - eps:
-            half_level = 1.0 - 0.5 * (1.0 - f_min)
-            select = f <= half_level
-            centre = w[int(np.argmin(f))]
-            kind = "absorption"
-        elif f_max > 1.0 + eps:
-            half_level = 1.0 + 0.5 * (f_max - 1.0)
-            select = f >= half_level
-            centre = w[int(np.argmax(f))]
-            kind = "emission"
-        else:
-            return None, None, None
+        centre = centre_hint
 
     if select.sum() < 2:
         return None, None, kind
@@ -885,22 +870,34 @@ class LocalBOSSSpectraProcessor:
                 extra_mask = None
                 if balmer_mask is not None and self.balmer_mask_stage in {"p98", "fit+p98"}:
                     extra_mask = result.get("fwhm_mask")
-                # For Balmer windows where any line is in emission, skip p98
-                # entirely.  Applying fwhm_mask as extra_mask risks leaving too
-                # few pseudo-continuum pixels when the emission is broad (the
-                # mask may cover most of the window), making the scale factor
-                # unreliable.  The balmer_subtract refit already suppresses the
-                # emission peak during the sigma-clip spline fit, so the
-                # continuum from that stage is used directly without p98 scaling.
+                # For Balmer windows where the current flux_norm shows emission
+                # near a Balmer line centre (median within 5 Å of centre > 1.05),
+                # skip p98 entirely.  The emission peak biases the percentile
+                # upward, scaling the continuum to match the peak height and
+                # suppressing the emission in the normalised spectrum.  Applying
+                # fwhm_mask as extra_mask is not used here because the emission
+                # FWHM mask can be very wide for broad emission lines, leaving
+                # too few pseudo-continuum pixels for a reliable scale estimate.
+                # The balmer_subtract refit (sigma_upper clipping of the spline)
+                # already places the continuum at the pseudo-continuum level.
                 if extra_mask is None:
-                    _fwhm_meta = result.get("fwhm_meta")
-                    if isinstance(_fwhm_meta, dict):
-                        _lines_meta = _fwhm_meta.get("lines", {})
-                        if isinstance(_lines_meta, dict) and any(
-                            isinstance(_lm, dict) and _lm.get("kind") == "emission"
-                            for _lm in _lines_meta.values()
-                        ):
-                            continue  # skip p98 for this emission window
+                    _wave_w = np.asarray(result["wave"], dtype=float)
+                    _fn_w = np.asarray(result.get("flux_norm", []), dtype=float)
+                    if _fn_w.size == _wave_w.size:
+                        _group_lines = [str(_l) for _l in result.get("lines", [])]
+                        for _line in BALMER_LINES:
+                            if _line not in _group_lines:
+                                continue
+                            _centre = BALMER_CENTRES.get(_line)
+                            if _centre is None:
+                                continue
+                            _near = (np.abs(_wave_w - _centre) < 5.0) & np.isfinite(_fn_w)
+                            if _near.sum() >= 3 and float(np.nanmedian(_fn_w[_near])) > 1.05:
+                                break  # emission detected — skip p98 for this window
+                        else:
+                            _line = None  # no emission found, proceed normally
+                        if _line is not None:
+                            continue  # skip p98 renorm for this emission window
                 cont = renorm_p98_continuum(
                     wave_win,
                     flux_win,
