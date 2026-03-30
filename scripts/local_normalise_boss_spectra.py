@@ -885,11 +885,13 @@ class LocalBOSSSpectraProcessor:
                 extra_mask = None
                 if balmer_mask is not None and self.balmer_mask_stage in {"p98", "fit+p98"}:
                     extra_mask = result.get("fwhm_mask")
-                # For Balmer windows where any line is in emission, always
-                # exclude the emission core from the p98 percentile regardless
-                # of balmer_mask_stage.  Without this, the emission peak biases
-                # the percentile upward and the continuum is scaled to match the
-                # peak, which suppresses the emission in the normalised spectrum.
+                # For Balmer windows where any line is in emission, skip p98
+                # entirely.  Applying fwhm_mask as extra_mask risks leaving too
+                # few pseudo-continuum pixels when the emission is broad (the
+                # mask may cover most of the window), making the scale factor
+                # unreliable.  The balmer_subtract refit already suppresses the
+                # emission peak during the sigma-clip spline fit, so the
+                # continuum from that stage is used directly without p98 scaling.
                 if extra_mask is None:
                     _fwhm_meta = result.get("fwhm_meta")
                     if isinstance(_fwhm_meta, dict):
@@ -898,7 +900,7 @@ class LocalBOSSSpectraProcessor:
                             isinstance(_lm, dict) and _lm.get("kind") == "emission"
                             for _lm in _lines_meta.values()
                         ):
-                            extra_mask = result.get("fwhm_mask")
+                            continue  # skip p98 for this emission window
                 cont = renorm_p98_continuum(
                     wave_win,
                     flux_win,
