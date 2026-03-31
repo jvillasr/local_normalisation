@@ -80,6 +80,14 @@ def import_hotstars_normalisation(hotstars_code: Path):
     return continuum_iterative_sigma_clip, TELLURIC_BANDS
 
 
+def write_json_if_changed(path: Path, payload: dict[str, object]) -> bool:
+    rendered = json.dumps(payload, indent=2, sort_keys=True)
+    if path.exists() and path.read_text(encoding="utf-8") == rendered:
+        return False
+    path.write_text(rendered, encoding="utf-8")
+    return True
+
+
 def resolve_bundle_path(specfann_dir: Path, bundle_name: str | None, bundle_path: str | None) -> Path:
     if bundle_path:
         return Path(bundle_path).expanduser()
@@ -1018,24 +1026,43 @@ class LocalBOSSSpectraProcessor:
         new_rows: list[dict[str, object]] = []
         existing_spec_files = existing_spec_files or set()
 
+        fits_paths = []
+        if self.allowed_spectra is None:
+            fits_paths = sorted(field_dir.glob("*.fits"))
+        else:
+            for spec_file in sorted(self.allowed_spectra[field_name].keys()):
+                fits_path = field_dir / spec_file
+                if fits_path.exists():
+                    fits_paths.append(fits_path)
+                else:
+                    print(f"[missing] {fits_path}")
+
         h5f = None
         if self.write_output:
+            if not self.overwrite and fits_paths and all(path.name in existing_spec_files for path in fits_paths):
+                updates = pd.DataFrame(
+                    columns=[
+                        "field",
+                        "spectrum_name",
+                        "spec_file",
+                        "sdss_id",
+                        "processed_time",
+                        "h5_file",
+                        "halpha_emission_detected",
+                        "p98_emission_skip_lines_json",
+                    ]
+                )
+                return {
+                    "field": field_name,
+                    "processed_count": 0,
+                    "failed_count": 0,
+                    "updates": updates,
+                }
             h5f = h5py.File(output_file, "a")
             if "normalisation" not in h5f.attrs:
                 h5f.attrs["normalisation"] = self.normalisation_label
             h5f.attrs["grid"] = "windowed"
             h5f.attrs["output_format"] = "windowed"
-
-            fits_paths = []
-            if self.allowed_spectra is None:
-                fits_paths = sorted(field_dir.glob("*.fits"))
-            else:
-                for spec_file in sorted(self.allowed_spectra[field_name].keys()):
-                    fits_path = field_dir / spec_file
-                    if fits_path.exists():
-                        fits_paths.append(fits_path)
-                    else:
-                        print(f"[missing] {fits_path}")
 
             for fits_path in fits_paths:
                 if remaining_total is not None and processed_here >= remaining_total:
@@ -1245,8 +1272,10 @@ class LocalBOSSSpectraProcessor:
                 subset=["field", "spec_file"],
                 keep="last",
             ).reset_index(drop=True)
-        if self.write_output:
+        registry_saved = False
+        if self.write_output and registry_updates:
             self.save_registry()
+            registry_saved = True
 
         print("\nProcessing summary:")
         print(f"Fields scheduled: {total_fields}")
@@ -1254,6 +1283,10 @@ class LocalBOSSSpectraProcessor:
         print(f"Fields failed: {failed_fields}")
         print(f"Spectra processed: {processed_total}")
         print(f"Spectra failed: {failed_spectra}")
+        if processed_total == 0:
+            print("No spectra were processed; existing outputs were left unchanged.")
+        elif self.write_output and not registry_saved:
+            print("No registry updates were required.")
 
 
 def main() -> None:
@@ -1488,7 +1521,7 @@ def main() -> None:
             "stage": args.balmer_mask_stage,
             "smooth_sigma_px": args.balmer_mask_smooth,
         }
-    config_path.write_text(json.dumps(config_payload, indent=2, sort_keys=True), encoding="utf-8")
+    config_written = write_json_if_changed(config_path, config_payload)
 
     telluric_masks = telluric_bands if args.mask_telluric else None
     field_filter = [item.strip() for item in args.fields.split(",") if item.strip()] if args.fields else None
@@ -1530,7 +1563,12 @@ def main() -> None:
     )
     processor.process_all_fields(field_filter=field_filter, max_workers=args.max_workers)
 
-    print(f"Registry saved at {processor.registry_file}")
+    if processor.write_output and processor.registry_file.exists():
+        print(f"Registry available at {processor.registry_file}")
+    if config_written:
+        print(f"Config written at {config_path}")
+    else:
+        print(f"Config unchanged at {config_path}")
 
 
 if __name__ == "__main__":
