@@ -782,7 +782,16 @@ class LocalBOSSSpectraProcessor:
             self.registry = pd.DataFrame()
 
     def _prepare_registry(self) -> None:
-        required = ["field", "spectrum_name", "spec_file", "sdss_id", "processed_time", "h5_file"]
+        required = [
+            "field",
+            "spectrum_name",
+            "spec_file",
+            "sdss_id",
+            "processed_time",
+            "h5_file",
+            "halpha_emission_detected",
+            "p98_emission_skip_lines_json",
+        ]
         for col in required:
             if col not in self.registry.columns:
                 self.registry[col] = pd.NA
@@ -809,7 +818,7 @@ class LocalBOSSSpectraProcessor:
 
     def process_spectrum(
         self, fits_path: Path
-    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str]]:
         wave, flux, ivar = load_spectrum(fits_path)
         base_mask = np.isfinite(wave) & np.isfinite(flux)
         if ivar is not None:
@@ -869,6 +878,7 @@ class LocalBOSSSpectraProcessor:
                 self.line_windows,
                 **bs_kwargs,
             )
+        p98_emission_skip_lines: list[str] = []
         if self.p98_renorm:
             for result in window_results:
                 wave_win = result["wave"]
@@ -905,6 +915,9 @@ class LocalBOSSSpectraProcessor:
                         else:
                             _line = None  # no emission found, proceed normally
                         if _line is not None:
+                            if _line not in p98_emission_skip_lines:
+                                p98_emission_skip_lines.append(_line)
+                            result["meta"]["p98_emission_skip_line"] = _line
                             continue  # skip p98 renorm for this emission window
                 cont = renorm_p98_continuum(
                     wave_win,
@@ -926,7 +939,7 @@ class LocalBOSSSpectraProcessor:
                     mpos = ivar_win > 0
                     ivar_norm[mpos] = ivar_win[mpos] * (cont[mpos] ** 2)
                     result["ivar_norm"] = ivar_norm
-        return window_results, group_meta
+        return window_results, group_meta, p98_emission_skip_lines
 
     def plot_line_diagnostics(
         self,
@@ -987,7 +1000,16 @@ class LocalBOSSSpectraProcessor:
                 "processed_count": 0,
                 "failed_count": 0,
                 "updates": pd.DataFrame(
-                    columns=["field", "spectrum_name", "spec_file", "sdss_id", "processed_time", "h5_file"]
+                    columns=[
+                        "field",
+                        "spectrum_name",
+                        "spec_file",
+                        "sdss_id",
+                        "processed_time",
+                        "h5_file",
+                        "halpha_emission_detected",
+                        "p98_emission_skip_lines_json",
+                    ]
                 ),
             }
         output_file = self.output_dir / f"{field_name}.h5"
@@ -1040,7 +1062,19 @@ class LocalBOSSSpectraProcessor:
                     continue
 
                 try:
-                    window_results, group_meta = self.process_spectrum(fits_path)
+                    window_results, group_meta, p98_emission_skip_lines = self.process_spectrum(fits_path)
+                    halpha_emission_detected = "HALPHA" in p98_emission_skip_lines
+                    if p98_emission_skip_lines:
+                        skip_lines_str = ",".join(p98_emission_skip_lines)
+                        sdss_id_str = str(sdss_id) if sdss_id is not None else "NA"
+                        print(
+                            "[balmer-emission] "
+                            f"field={field_name} "
+                            f"spec_file={spec_file} "
+                            f"sdss_id={sdss_id_str} "
+                            f"halpha_emission_detected={str(halpha_emission_detected).lower()} "
+                            f"skipped_lines={skip_lines_str}"
+                        )
                     if self.plot_dir is not None:
                         for result in window_results:
                             self.plot_line_diagnostics(spec_name=spec_name, window_result=result)
@@ -1073,6 +1107,8 @@ class LocalBOSSSpectraProcessor:
                         grp.attrs["spec_file"] = spec_file
                         if sdss_id is not None:
                             grp.attrs["sdss_id"] = sdss_id
+                        grp.attrs["halpha_emission_detected"] = halpha_emission_detected
+                        grp.attrs["p98_emission_skip_lines_json"] = json.dumps(p98_emission_skip_lines)
                         grp.attrs["line_groups_json"] = json.dumps(group_meta)
 
                         new_rows.append(
@@ -1083,6 +1119,8 @@ class LocalBOSSSpectraProcessor:
                                 "sdss_id": sdss_id,
                                 "processed_time": grp.attrs["processed_time"],
                                 "h5_file": output_file.name,
+                                "halpha_emission_detected": halpha_emission_detected,
+                                "p98_emission_skip_lines_json": json.dumps(p98_emission_skip_lines),
                             }
                         )
                         processed_here += 1
@@ -1095,7 +1133,16 @@ class LocalBOSSSpectraProcessor:
 
         updates = pd.DataFrame(
             new_rows,
-            columns=["field", "spectrum_name", "spec_file", "sdss_id", "processed_time", "h5_file"],
+            columns=[
+                "field",
+                "spectrum_name",
+                "spec_file",
+                "sdss_id",
+                "processed_time",
+                "h5_file",
+                "halpha_emission_detected",
+                "p98_emission_skip_lines_json",
+            ],
         )
         return {
             "field": field_name,
