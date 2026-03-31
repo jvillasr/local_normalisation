@@ -870,6 +870,34 @@ class LocalBOSSSpectraProcessor:
                 extra_mask = None
                 if balmer_mask is not None and self.balmer_mask_stage in {"p98", "fit+p98"}:
                     extra_mask = result.get("fwhm_mask")
+                # For Balmer windows where the current flux_norm shows emission
+                # near a Balmer line centre (median within 5 Å of centre > 1.05),
+                # skip p98 entirely.  The emission peak biases the percentile
+                # upward, scaling the continuum to match the peak height and
+                # suppressing the emission in the normalised spectrum.  Applying
+                # fwhm_mask as extra_mask is not used here because the emission
+                # FWHM mask can be very wide for broad emission lines, leaving
+                # too few pseudo-continuum pixels for a reliable scale estimate.
+                # The balmer_subtract refit (sigma_upper clipping of the spline)
+                # already places the continuum at the pseudo-continuum level.
+                if extra_mask is None:
+                    _wave_w = np.asarray(result["wave"], dtype=float)
+                    _fn_w = np.asarray(result.get("flux_norm", []), dtype=float)
+                    if _fn_w.size == _wave_w.size:
+                        _group_lines = [str(_l) for _l in result.get("lines", [])]
+                        for _line in BALMER_LINES:
+                            if _line not in _group_lines:
+                                continue
+                            _centre = BALMER_CENTRES.get(_line)
+                            if _centre is None:
+                                continue
+                            _near = (np.abs(_wave_w - _centre) < 5.0) & np.isfinite(_fn_w)
+                            if _near.sum() >= 3 and float(np.nanmedian(_fn_w[_near])) > 1.05:
+                                break  # emission detected — skip p98 for this window
+                        else:
+                            _line = None  # no emission found, proceed normally
+                        if _line is not None:
+                            continue  # skip p98 renorm for this emission window
                 cont = renorm_p98_continuum(
                     wave_win,
                     flux_win,
