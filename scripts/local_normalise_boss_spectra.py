@@ -786,6 +786,8 @@ class LocalBOSSSpectraProcessor:
             else:
                 self.registry = pd.DataFrame()
             self._prepare_registry()
+            if not self.overwrite:
+                self.recover_registry_from_outputs()
         else:
             self.registry_file = self.output_dir / "processed_registry.parquet"
             self.registry = pd.DataFrame()
@@ -824,6 +826,63 @@ class LocalBOSSSpectraProcessor:
 
     def save_registry(self) -> None:
         self.registry.to_parquet(self.registry_file, index=False)
+
+    def recover_registry_from_outputs(self) -> None:
+        h5_paths = sorted(self.output_dir.glob("*.h5"))
+        if not h5_paths:
+            return
+
+        recovered_rows: list[dict[str, object]] = []
+        bad_files: list[tuple[str, str]] = []
+        for h5_path in h5_paths:
+            try:
+                with h5py.File(h5_path, "r") as handle:
+                    for group_name in handle.keys():
+                        grp = handle[group_name]
+                        spec_file = grp.attrs.get("spec_file")
+                        if isinstance(spec_file, bytes):
+                            spec_file = spec_file.decode()
+                        sdss_id = grp.attrs.get("sdss_id")
+                        if isinstance(sdss_id, bytes):
+                            sdss_id = sdss_id.decode()
+                        recovered_rows.append(
+                            {
+                                "field": h5_path.stem,
+                                "spectrum_name": str(group_name),
+                                "spec_file": spec_file,
+                                "sdss_id": None if sdss_id in (None, "") else str(sdss_id),
+                                "processed_time": float(grp.attrs.get("processed_time", float("nan"))),
+                                "h5_file": h5_path.name,
+                                "halpha_emission_detected": bool(grp.attrs.get("halpha_emission_detected", False)),
+                                "p98_emission_skip_lines_json": str(
+                                    grp.attrs.get("p98_emission_skip_lines_json", "[]")
+                                ),
+                            }
+                        )
+            except Exception as exc:
+                bad_files.append((h5_path.name, repr(exc)))
+
+        if recovered_rows:
+            before = len(self.registry.drop_duplicates(subset=["field", "spec_file"], keep="last"))
+            self.registry = pd.concat([self.registry, pd.DataFrame(recovered_rows)], ignore_index=True)
+            self.registry = self.registry.drop_duplicates(
+                subset=["field", "spec_file"],
+                keep="last",
+            ).reset_index(drop=True)
+            after = len(self.registry)
+            if after != before:
+                self.save_registry()
+            print(
+                f"Recovered registry rows from existing outputs: added_rows={after - before} "
+                f"total_rows={after} scanned_h5_files={len(h5_paths)} bad_h5_files={len(bad_files)}",
+                flush=True,
+            )
+        if bad_files:
+            preview = "; ".join(f"{name}: {reason}" for name, reason in bad_files[:5])
+            print(
+                f"[corrupt-output-summary] bad_h5_files={len(bad_files)} preview={preview}",
+                flush=True,
+            )
 
     def flush_registry_updates(self, registry_updates: list[pd.DataFrame]) -> int:
         if not registry_updates:
