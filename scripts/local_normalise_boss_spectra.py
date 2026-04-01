@@ -1072,7 +1072,20 @@ class LocalBOSSSpectraProcessor:
                     "failed_count": 0,
                     "updates": updates,
                 }
-            h5f = h5py.File(output_file, "a")
+            open_mode = "a"
+            try:
+                h5f = h5py.File(output_file, open_mode)
+            except Exception as exc:
+                if output_file.exists() and not self.overwrite and not existing_spec_files:
+                    print(
+                        f"[corrupt-output] field={field_name} path={output_file} "
+                        f"action=recreate reason={exc}",
+                        flush=True,
+                    )
+                    open_mode = "w"
+                    h5f = h5py.File(output_file, open_mode)
+                else:
+                    raise RuntimeError(f"Failed to open output file {output_file}: {exc}") from exc
             if "normalisation" not in h5f.attrs:
                 h5f.attrs["normalisation"] = self.normalisation_label
             h5f.attrs["grid"] = "windowed"
@@ -1314,6 +1327,11 @@ class LocalBOSSSpectraProcessor:
             print("No spectra were processed; existing outputs were left unchanged.", flush=True)
         elif self.write_output and not registry_saved:
             print("No registry updates were required.", flush=True)
+        if failed_fields or failed_spectra:
+            raise RuntimeError(
+                "Local-normalisation run completed with failures: "
+                f"failed_fields={failed_fields}, failed_spectra={failed_spectra}"
+            )
 
 
 def main() -> None:
