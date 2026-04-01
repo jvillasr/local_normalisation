@@ -72,6 +72,7 @@ HEI4471_GROUP_BASE_LINES = ["HEI4471", "HEII4541"]
 HEII4686_GROUP_BASE_LINES = ["HEII4686", "NIIItrip", "CIII4650"]
 FIT_STAGE_CHOICES = ["standard", "balmer_subtract"]
 REGISTRY_CHECKPOINT_FIELDS = 100
+REGISTRY_RECOVERY_PROGRESS_FILES = 100
 
 
 def import_hotstars_normalisation(hotstars_code: Path):
@@ -830,11 +831,16 @@ class LocalBOSSSpectraProcessor:
     def recover_registry_from_outputs(self) -> None:
         h5_paths = sorted(self.output_dir.glob("*.h5"))
         if not h5_paths:
+            print("Registry recovery skipped: no existing field HDF5 outputs found.", flush=True)
             return
 
+        print(
+            f"Registry recovery starting: scanning {len(h5_paths)} existing field HDF5 files from {self.output_dir}",
+            flush=True,
+        )
         recovered_rows: list[dict[str, object]] = []
         bad_files: list[tuple[str, str]] = []
-        for h5_path in h5_paths:
+        for idx, h5_path in enumerate(h5_paths, start=1):
             try:
                 with h5py.File(h5_path, "r") as handle:
                     for group_name in handle.keys():
@@ -861,6 +867,15 @@ class LocalBOSSSpectraProcessor:
                         )
             except Exception as exc:
                 bad_files.append((h5_path.name, repr(exc)))
+                print(f"[corrupt-output] path={h5_path} reason={exc!r}", flush=True)
+            if idx % REGISTRY_RECOVERY_PROGRESS_FILES == 0 or idx == len(h5_paths):
+                print(
+                    "Registry recovery progress: "
+                    f"scanned_h5_files={idx}/{len(h5_paths)} "
+                    f"recovered_rows={len(recovered_rows)} "
+                    f"bad_h5_files={len(bad_files)}",
+                    flush=True,
+                )
 
         if recovered_rows:
             before = len(self.registry.drop_duplicates(subset=["field", "spec_file"], keep="last"))
@@ -873,8 +888,14 @@ class LocalBOSSSpectraProcessor:
             if after != before:
                 self.save_registry()
             print(
-                f"Recovered registry rows from existing outputs: added_rows={after - before} "
+                f"Registry recovery complete: added_rows={after - before} "
                 f"total_rows={after} scanned_h5_files={len(h5_paths)} bad_h5_files={len(bad_files)}",
+                flush=True,
+            )
+        else:
+            print(
+                f"Registry recovery complete: added_rows=0 total_rows={len(self.registry)} "
+                f"scanned_h5_files={len(h5_paths)} bad_h5_files={len(bad_files)}",
                 flush=True,
             )
         if bad_files:
