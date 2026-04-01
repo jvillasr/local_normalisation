@@ -71,6 +71,7 @@ HGAMMA_GROUP_BASE_LINES = ["HGAMMA", "HEI4387", "NIII4379"]
 HEI4471_GROUP_BASE_LINES = ["HEI4471", "HEII4541"]
 HEII4686_GROUP_BASE_LINES = ["HEII4686", "NIIItrip", "CIII4650"]
 FIT_STAGE_CHOICES = ["standard", "balmer_subtract"]
+REGISTRY_CHECKPOINT_FIELDS = 100
 
 
 def import_hotstars_normalisation(hotstars_code: Path):
@@ -824,6 +825,19 @@ class LocalBOSSSpectraProcessor:
     def save_registry(self) -> None:
         self.registry.to_parquet(self.registry_file, index=False)
 
+    def flush_registry_updates(self, registry_updates: list[pd.DataFrame]) -> int:
+        if not registry_updates:
+            return 0
+        added_rows = int(sum(len(df) for df in registry_updates))
+        self.registry = pd.concat([self.registry, *registry_updates], ignore_index=True)
+        self.registry = self.registry.drop_duplicates(
+            subset=["field", "spec_file"],
+            keep="last",
+        ).reset_index(drop=True)
+        self.save_registry()
+        registry_updates.clear()
+        return added_rows
+
     def process_spectrum(
         self, fits_path: Path
     ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str]]:
@@ -1236,13 +1250,22 @@ class LocalBOSSSpectraProcessor:
                     completed_fields += 1
                     print(
                         f"Completed field {field_dir.name}: "
-                        f"{int(result['processed_count'])} spectra, {int(result['failed_count'])} failures"
+                        f"{int(result['processed_count'])} spectra, {int(result['failed_count'])} failures",
+                        flush=True,
                     )
+                    if self.write_output and registry_updates and completed_fields % REGISTRY_CHECKPOINT_FIELDS == 0:
+                        checkpoint_rows = self.flush_registry_updates(registry_updates)
+                        print(
+                            f"Registry checkpoint saved at {self.registry_file}: "
+                            f"added_rows={checkpoint_rows} total_rows={len(self.registry)} "
+                            f"completed_fields={completed_fields} spectra_processed={processed_total}",
+                            flush=True,
+                        )
                 except Exception as exc:
                     failed_fields += 1
-                    print(f"Failed field {field_dir.name}: {exc}")
+                    print(f"Failed field {field_dir.name}: {exc}", flush=True)
         else:
-            print(f"Processing fields in parallel with {max_workers} workers")
+            print(f"Processing fields in parallel with {max_workers} workers", flush=True)
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_field = {
                     executor.submit(
@@ -1260,33 +1283,37 @@ class LocalBOSSSpectraProcessor:
                         completed_fields += 1
                         print(
                             f"Completed field {field_name}: "
-                            f"{int(result['processed_count'])} spectra, {int(result['failed_count'])} failures"
+                            f"{int(result['processed_count'])} spectra, {int(result['failed_count'])} failures",
+                            flush=True,
                         )
+                        if self.write_output and registry_updates and completed_fields % REGISTRY_CHECKPOINT_FIELDS == 0:
+                            checkpoint_rows = self.flush_registry_updates(registry_updates)
+                            print(
+                                f"Registry checkpoint saved at {self.registry_file}: "
+                                f"added_rows={checkpoint_rows} total_rows={len(self.registry)} "
+                                f"completed_fields={completed_fields} spectra_processed={processed_total}",
+                                flush=True,
+                            )
                     except Exception as exc:
                         failed_fields += 1
-                        print(f"Failed field {field_name}: {exc}")
+                        print(f"Failed field {field_name}: {exc}", flush=True)
 
         if registry_updates:
-            self.registry = pd.concat([self.registry, *registry_updates], ignore_index=True)
-            self.registry = self.registry.drop_duplicates(
-                subset=["field", "spec_file"],
-                keep="last",
-            ).reset_index(drop=True)
+            self.flush_registry_updates(registry_updates)
         registry_saved = False
-        if self.write_output and registry_updates:
-            self.save_registry()
+        if self.write_output and not self.registry.empty:
             registry_saved = True
 
-        print("\nProcessing summary:")
-        print(f"Fields scheduled: {total_fields}")
-        print(f"Fields completed: {completed_fields}")
-        print(f"Fields failed: {failed_fields}")
-        print(f"Spectra processed: {processed_total}")
-        print(f"Spectra failed: {failed_spectra}")
+        print("\nProcessing summary:", flush=True)
+        print(f"Fields scheduled: {total_fields}", flush=True)
+        print(f"Fields completed: {completed_fields}", flush=True)
+        print(f"Fields failed: {failed_fields}", flush=True)
+        print(f"Spectra processed: {processed_total}", flush=True)
+        print(f"Spectra failed: {failed_spectra}", flush=True)
         if processed_total == 0:
-            print("No spectra were processed; existing outputs were left unchanged.")
+            print("No spectra were processed; existing outputs were left unchanged.", flush=True)
         elif self.write_output and not registry_saved:
-            print("No registry updates were required.")
+            print("No registry updates were required.", flush=True)
 
 
 def main() -> None:
