@@ -1587,9 +1587,6 @@ def main() -> None:
         window_pad=args.window_pad,
         rv_pad_kms=args.rv_pad_kms,
     )
-    windows = restrict_hdelta_group_windows(
-        bundle_path, windows, window_pad=args.window_pad, rv_pad_kms=args.rv_pad_kms
-    )
     if missing:
         print(f"Missing line windows for {len(missing)} lines: {', '.join(missing)}")
     if not windows:
