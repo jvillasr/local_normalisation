@@ -1118,6 +1118,7 @@ class LocalBOSSSpectraProcessor:
         processed_here = 0
         failed_here = 0
         new_rows: list[dict[str, object]] = []
+        written_group_names: list[str] = []
         existing_spec_files = existing_spec_files or set()
 
         fits_paths = []
@@ -1257,6 +1258,7 @@ class LocalBOSSSpectraProcessor:
                                 "p98_emission_skip_lines_json": json.dumps(p98_emission_skip_lines),
                             }
                         )
+                        written_group_names.append(group_name)
                         processed_here += 1
 
                 except Exception as exc:
@@ -1264,6 +1266,27 @@ class LocalBOSSSpectraProcessor:
                     print(f"Failed to process {fits_path}: {exc}")
         if h5f is not None:
             h5f.close()
+
+        if self.write_output and processed_here > 0:
+            if len(new_rows) != processed_here:
+                raise RuntimeError(
+                    f"Field {field_name} reported processed_count={processed_here} "
+                    f"but only {len(new_rows)} registry rows were prepared"
+                )
+            if not output_file.exists():
+                raise RuntimeError(
+                    f"Field {field_name} reported processed_count={processed_here} "
+                    f"but output file {output_file} is missing after write"
+                )
+            with h5py.File(output_file, "r") as verify_h5:
+                present_groups = set(verify_h5.keys())
+            missing_groups = [group_name for group_name in written_group_names if group_name not in present_groups]
+            if missing_groups:
+                preview = ", ".join(missing_groups[:5])
+                raise RuntimeError(
+                    f"Field {field_name} reported processed_count={processed_here} "
+                    f"but {len(missing_groups)} written groups are absent after close: {preview}"
+                )
 
         updates = pd.DataFrame(
             new_rows,
@@ -1310,6 +1333,7 @@ class LocalBOSSSpectraProcessor:
             max_workers = 1
 
         existing_lookup = self._existing_registry_lookup()
+        registry_rows_before = len(self.registry)
         registry_updates: list[pd.DataFrame] = []
         processed_total = 0
         failed_spectra = 0
@@ -1393,9 +1417,19 @@ class LocalBOSSSpectraProcessor:
 
         if registry_updates:
             self.flush_registry_updates(registry_updates)
+        registry_rows_after = len(self.registry)
         registry_saved = False
         if self.write_output and not self.registry.empty:
             registry_saved = True
+
+        if self.write_output and processed_total > 0 and not self.overwrite:
+            expected_registry_rows = registry_rows_before + processed_total
+            if registry_rows_after != expected_registry_rows:
+                raise RuntimeError(
+                    "Registry row count mismatch after processing: "
+                    f"before={registry_rows_before}, processed_total={processed_total}, "
+                    f"after={registry_rows_after}, expected_after={expected_registry_rows}"
+                )
 
         print("\nProcessing summary:", flush=True)
         print(f"Fields scheduled: {total_fields}", flush=True)
