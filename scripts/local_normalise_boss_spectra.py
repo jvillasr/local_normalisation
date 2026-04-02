@@ -782,12 +782,13 @@ class LocalBOSSSpectraProcessor:
         if self.write_output:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             self.registry_file = self.output_dir / "processed_registry.parquet"
+            registry_existed = self.registry_file.exists()
             if self.registry_file.exists():
                 self.registry = pd.read_parquet(self.registry_file)
             else:
                 self.registry = pd.DataFrame()
             self._prepare_registry()
-            if not self.overwrite:
+            if not self.overwrite and (not registry_existed or self.registry.empty):
                 self.recover_registry_from_outputs()
         else:
             self.registry_file = self.output_dir / "processed_registry.parquet"
